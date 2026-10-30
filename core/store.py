@@ -569,6 +569,19 @@ class Store:
         )
         return [self._task(row) for row in rows]
 
+    def list_unreminded_due(
+        self, due_before: float, statuses: tuple[TaskStatus, ...]
+    ) -> list[Task]:
+        """Tasks in any space with ``reminded`` false, a non-null ``due_at``
+        <= ``due_before`` and a status in ``statuses``, ordered by ``due_at``,
+        then ``space_id``, ``seq``. (M2)"""
+        raise NotImplementedError
+
+    def list_done_before(self, done_before: float) -> list[Task]:
+        """DONE tasks in any space with ``done_at`` <= ``done_before``,
+        ordered by ``done_at``, then ``space_id``, ``seq``. (M2)"""
+        raise NotImplementedError
+
     # ----- operation log -----
 
     def add_event(self, draft: TaskEventDraft) -> TaskEvent:

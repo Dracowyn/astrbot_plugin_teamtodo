@@ -72,6 +72,15 @@ def task_line(
     return " ".join(parts)
 
 
+def reminder_text(task: Task, space_name: str, now: float, tz: tzinfo) -> str:
+    """Body of a due reminder (M2); the caller prepends the @ mentions.
+
+    ``⏰ 空间名#3 标题 将于 11-05 23:59 到期`` when ``due_at >= now``, otherwise
+    ``⏰ 空间名#3 标题 已于 11-05 23:59 逾期``. Due time uses ``format_due``.
+    """
+    raise NotImplementedError
+
+
 def task_detail(
     task: Task,
     space_name: str,
