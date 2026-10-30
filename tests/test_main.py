@@ -38,8 +38,10 @@ class FakeEvent:
         private=False,
         bot_admin=False,
         group=None,
+        platform_name="aiocqhttp",
     ):
         self.components = list(components)
+        self.platform_name = platform_name
         self.sender = sender
         self.name = name
         self.private = private
@@ -52,6 +54,9 @@ class FakeEvent:
 
     def get_platform_id(self):
         return "qq"
+
+    def get_platform_name(self):
+        return self.platform_name
 
     def get_self_id(self):
         return "bot"
@@ -694,6 +699,157 @@ async def test_admin_second_unknown_raw_id_failure_rolls_back_every_target(
     assert plugin._store.list_members(1) == baseline_members
     assert plugin._store.list_space_events(1) == baseline_events
     admin_group_members.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "components",
+    [
+        [Comp.Plain(text="/todo admin +123456 +234567 -345678")],
+        [Comp.Plain(text="/todo admin +99999999")],
+        [Comp.Plain(text="/todo admin +"), Comp.At(qq="mod", name="Moderator")],
+        [Comp.Plain(text="/todo admin")],
+        [Comp.Plain(text="/todo admin nonsense")],
+        [
+            Comp.Plain(
+                text="/todo admin " + " ".join(f"+{10000 + i}" for i in range(30))
+            )
+        ],
+    ],
+    ids=["raw-ids", "other-id", "mention", "empty", "malformed", "over-cap"],
+)
+async def test_admin_non_owner_gets_one_denial_without_lookups_or_fetch(
+    plugin, admin_group_members, monkeypatch, components
+):
+    """Denial comes first and reveals nothing about the given targets."""
+    await plugin.initialize()
+    await run(plugin, Comp.Plain(text="/todo list"), group=owner_group())
+    target = UserRef("qq", "123456")
+    with plugin._store.transaction():
+        plugin._store.upsert_member(1, target, "Known")
+    baseline = (plugin._store.list_members(1), plugin._store.list_space_events(1))
+    lookups = []
+    get_member = plugin._store.get_member
+
+    def recording_get_member(space_id, user):
+        lookups.append(user)
+        return get_member(space_id, user)
+
+    monkeypatch.setattr(plugin._store, "get_member", recording_get_member)
+    admin_group_members.return_value = [GroupMember(target, "Card", ("Card",))]
+
+    replies = await run(plugin, *components, sender="pleb", group=owner_group())
+
+    assert replies == [DENIAL_MESSAGES[Op.MANAGE_ADMINS]]
+    assert set(lookups) <= {UserRef("qq", "pleb")}
+    admin_group_members.assert_not_called()
+    assert (plugin._store.list_members(1), plugin._store.list_space_events(1)) == (
+        baseline
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_denial_in_unbound_group_creates_no_space(
+    plugin, admin_group_members
+):
+    await plugin.initialize()
+
+    replies = await run(
+        plugin, Comp.Plain(text="/todo admin +123456"), sender="pleb", group=None
+    )
+
+    assert replies == [DENIAL_MESSAGES[Op.MANAGE_ADMINS]]
+    assert plugin._store.list_bindings(GROUP) == []
+    admin_group_members.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_owner_over_target_cap_gets_usage_without_fetch(
+    plugin, admin_group_members
+):
+    await plugin.initialize()
+    ids = " ".join(f"+{10000 + i}" for i in range(21))
+
+    replies = await run(
+        plugin, Comp.Plain(text=f"/todo admin {ids}"), group=owner_group()
+    )
+
+    assert replies[0].startswith("一次最多操作 20 人")
+    admin_group_members.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_space_switch_during_fetch_cannot_skip_verification(
+    plugin, admin_group_members
+):
+    """TOCTOU: a member of space A is not registered in B without the group."""
+    await plugin.initialize()
+    owner = {"group": owner_group()}
+    await run(plugin, Comp.Plain(text="/todo list"), **owner)
+    member_of_a = UserRef("qq", "123456")
+    verified = UserRef("qq", "234567")
+    with plugin._store.transaction():
+        plugin._store.upsert_member(1, member_of_a, "Known")
+    await run(plugin, Comp.Plain(text="/todo space new Ops"), **owner)
+    await run(plugin, Comp.Plain(text="/todo use DevTeam"), **owner)
+    actor = main.build_actor(
+        FakeEvent(), SessionInfo(is_session_admin=True, group_name="Dev Team")
+    )
+
+    async def fetch(event):
+        plugin._service.use_space(actor, "Ops")
+        return [GroupMember(verified, "Card", ("Card",))]
+
+    admin_group_members.side_effect = fetch
+    baseline = {
+        space_id: (
+            plugin._store.list_members(space_id),
+            plugin._store.list_space_events(space_id),
+        )
+        for space_id in (1, 2)
+    }
+
+    replies = await run(plugin, Comp.Plain(text="/todo admin +123456 +234567"), **owner)
+
+    assert replies == ["找不到 QQ 号 123456：不是空间成员，也不在本群成员列表里"]
+    admin_group_members.assert_awaited_once()
+    for space_id, (members, events) in baseline.items():
+        assert plugin._store.list_members(space_id) == members
+        assert plugin._store.list_space_events(space_id) == events
+
+
+@pytest.mark.asyncio
+async def test_admin_raw_id_error_uses_neutral_label_off_qq(
+    plugin, admin_group_members
+):
+    await plugin.initialize()
+
+    replies = await run(
+        plugin,
+        Comp.Plain(text="/todo admin +123456"),
+        group=owner_group(),
+        platform_name="telegram",
+    )
+
+    assert replies == ["找不到 用户 ID 123456：不是空间成员，也不在本群成员列表里"]
+    admin_group_members.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_terminate_during_fetch_fails_cleanly(plugin, admin_group_members):
+    await plugin.initialize()
+
+    async def fetch(event):
+        plugin._service = None
+        return []
+
+    admin_group_members.side_effect = fetch
+
+    replies = await run(
+        plugin, Comp.Plain(text="/todo admin +123456"), group=owner_group()
+    )
+
+    assert replies == [main.GENERIC_FAILURE]
 
 
 @pytest.mark.asyncio

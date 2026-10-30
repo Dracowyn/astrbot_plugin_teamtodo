@@ -5,7 +5,13 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from astrbot_plugin_teamtodo.core import parsing
-from astrbot_plugin_teamtodo.core.models import Mention, Priority, TodoError, UserRef
+from astrbot_plugin_teamtodo.core.models import (
+    MAX_ASSIGNEES,
+    Mention,
+    Priority,
+    TodoError,
+    UserRef,
+)
 from astrbot_plugin_teamtodo.core.parsing import (
     parse_assign,
     parse_task_fields,
@@ -405,3 +411,23 @@ def test_admin_duplicate_proof_is_scoped_to_the_platform_instance():
 def test_task_assign_still_rejects_raw_ids(text):
     with pytest.raises(TodoError):
         parse_assign([text])
+
+
+def test_admin_accepts_up_to_the_target_cap_counting_distinct_targets():
+    ids = [f"+{10000 + i}" for i in range(MAX_ASSIGNEES - 1)]
+    mention = Mention(UserRef("qq", "mod"), "Mod")
+
+    ops, raw_additions = parsing.parse_admin(
+        [" ".join([*ids, ids[0]]) + " -", mention], "qq"
+    )
+
+    assert len(ops.add) + len(ops.remove) == MAX_ASSIGNEES
+    assert len(raw_additions) == MAX_ASSIGNEES - 1
+
+
+@pytest.mark.parametrize("sign", ["+", "-"])
+def test_admin_rejects_more_targets_than_the_cap(sign):
+    text = " ".join(f"{sign}{10000 + i}" for i in range(MAX_ASSIGNEES + 1))
+
+    with pytest.raises(TodoError, match=f"一次最多操作 {MAX_ASSIGNEES} 人"):
+        parsing.parse_admin([text], "qq")

@@ -1,14 +1,15 @@
 """Shared task limits, lifecycle transitions and transactional operation logs.
 
-Callers resolve identities, permissions and patch syntax before invoking these
-helpers inside their store transaction. Chat and WebUI writes share all rules;
-log identity is always explicit and independent of the task creator.
+Also holds the chat-side space role update (``set_roles``). Callers resolve
+identities, permissions and patch syntax before invoking these helpers inside
+their store transaction. Chat and WebUI writes share all rules; log identity
+is always explicit and independent of the task creator.
 """
 
 from __future__ import annotations
 
 import dataclasses as dcs
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from ..core.models import (
     MAX_ASSIGNEES,
@@ -16,8 +17,14 @@ from ..core.models import (
     MAX_TAG_CHARS,
     MAX_TAGS,
     MAX_TITLE_CHARS,
+    Actor,
     EventAction,
+    Member,
     Mention,
+    Space,
+    SpaceEventAction,
+    SpaceEventDraft,
+    SpaceRole,
     Task,
     TaskDraft,
     TaskEventDraft,
@@ -25,6 +32,7 @@ from ..core.models import (
     TodoError,
     UserRef,
 )
+from ..core.parsing import AssignOps
 from ..core.store import Store
 
 
@@ -135,3 +143,66 @@ def apply(
             store, saved, action, {"status": [task.status, saved.status]}, **identity
         )
     return saved
+
+
+def set_roles(
+    store: Store,
+    space: Space,
+    ops: AssignOps,
+    actor: Actor,
+    raw: frozenset[UserRef],
+    verified: Mapping[UserRef, str],
+    id_label: str,
+) -> list[Member]:
+    """Promote ``ops.add`` to admin and demote ``ops.remove``, logging changes.
+
+    Membership is decided here, inside the caller's transaction, so it always
+    refers to the space being modified. An added non-member joins first: a
+    mention proves presence, while a raw ID (in ``raw``) must be in
+    ``verified`` (the chat group's member list) and takes its group name.
+
+    Args:
+        store: Store with an open transaction.
+        space: The space being modified.
+        ops: Delta operations (``replace`` is ignored).
+        actor: The requesting user, recorded in the role logs.
+        raw: Additions given as raw IDs rather than mentions.
+        verified: Raw IDs found in the group's member list -> display name.
+        id_label: What a raw ID is called on this platform, for errors.
+
+    Returns:
+        The updated member rows, additions first, in argument order.
+
+    Raises:
+        TodoError: Unverified raw addition, non-member removal, or an owner.
+    """
+    changed = []
+    for mention, role in [(m, SpaceRole.ADMIN) for m in ops.add] + [
+        (m, SpaceRole.MEMBER) for m in ops.remove
+    ]:
+        user = mention.user
+        target = store.get_member(space.id, user)
+        if target is None and role == SpaceRole.ADMIN:
+            if user in raw and user not in verified:
+                raise TodoError(
+                    f"找不到 {id_label} {user.user_id}："
+                    "不是空间成员，也不在本群成员列表里"
+                )
+            name = verified[user] if user in raw else mention.name
+            target = store.upsert_member(space.id, user, name)
+        if target is None:
+            raise TodoError(f"{mention.name or user.user_id} 还不是这个空间的成员")
+        if target.role == SpaceRole.OWNER or target.user == space.owner:
+            raise TodoError("不能修改所有者的角色")
+        changed.append(store.set_member_role(space.id, target.user, role))
+        if target.role != role:
+            store.add_space_event(
+                SpaceEventDraft(
+                    space_id=space.id,
+                    action=SpaceEventAction.ROLE,
+                    detail={"user": target.user.key, "role": [target.role, role]},
+                    actor=actor.user,
+                    session=actor.session,
+                )
+            )
+    return changed

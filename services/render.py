@@ -23,6 +23,7 @@ from datetime import datetime, tzinfo
 from math import isfinite
 
 from ..core.models import (
+    MAX_ASSIGNEES,
     EventAction,
     Priority,
     Space,
@@ -399,7 +400,9 @@ def help_text() -> str:
             "/todo join <邀请码>：将本会话绑定到对应空间",
             "/todo leave <空间名>：解绑本会话与空间",
             "/todo claim：认领当前无主空间",
-            "/todo admin +@x / -@x 或 +QQ号 / -QQ号：任命或撤销当前空间管理员，"
-            "可混用；号码为 5–20 位 ASCII 数字，支持全角正负号和符号后空白",
+            "/todo admin +@x / -@x 或 +用户ID / -用户ID：任命或撤销当前空间管理员，"
+            f"可混用，一次最多 {MAX_ASSIGNEES} 人；"
+            "用户 ID（如 QQ 号）为 5–20 位 ASCII 数字，支持全角正负号和符号后空白；"
+            "新增的 ID 须为空间成员或在本群成员列表里",
         )
     )

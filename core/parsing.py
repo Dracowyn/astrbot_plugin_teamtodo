@@ -20,14 +20,15 @@ by whitespace. Field tokens may appear anywhere after the task reference:
 - assignment: ``+@a -@b`` accepts equivalent signs ``＋@a －@b``.
 - admin: every target needs a sign; raw IDs are 5–20 ASCII digits and use
   the current platform instance. Raw additions without a matching explicit
-  ``+@`` mention are returned separately for membership verification.
+  ``+@`` mention are returned separately for membership verification. At
+  most ``MAX_ASSIGNEES`` distinct targets per command.
 - everything else, joined by single spaces, is the title
 - a title wrapped in straight or curly double quotes is taken literally
   (its words are not interpreted as fields)
 
 Length and count limits are NOT enforced here (services enforce
-``core.models`` limits); syntax errors raise ``TodoError`` with a short
-Chinese message.
+``core.models`` limits), except the admin target cap; syntax errors raise
+``TodoError`` with a short Chinese message.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ import re
 from datetime import datetime
 
 from .dates import parse_due_tokens
-from .models import Mention, Priority, TodoError, UserRef
+from .models import MAX_ASSIGNEES, Mention, Priority, TodoError, UserRef
 
 Part = str | Mention
 
@@ -259,11 +260,16 @@ def parse_admin(
 ) -> tuple[AssignOps, frozenset[UserRef]]:
     """Parse signed admin mentions and 5–20 digit ASCII platform user IDs.
 
+    Args:
+        parts: Parser parts after ``admin``.
+        platform_id: Platform instance of the actor, used for raw IDs.
+
     Returns:
         Delta operations and raw additions without an explicit ``+`` mention.
 
     Raises:
-        TodoError: Empty arguments, unsigned targets, or malformed syntax.
+        TodoError: Empty arguments, unsigned targets, malformed syntax, or
+            more than ``MAX_ASSIGNEES`` distinct targets.
     """
     usage = "用法：/todo admin +@成员 -@成员 或 +用户ID -用户ID（5–20 位数字）"
     try:
@@ -309,6 +315,9 @@ def parse_admin(
             destination.setdefault(key, mention)
             if adding:
                 raw_additions[key] = mention.user
+        # Bounds the work an (as yet unchecked) caller can trigger downstream.
+        if len(additions) + len(removals) > MAX_ASSIGNEES:
+            raise TodoError(f"一次最多操作 {MAX_ASSIGNEES} 人\n{usage}")
     if not additions and not removals:
         raise TodoError(usage)
     return (

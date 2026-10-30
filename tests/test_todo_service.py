@@ -1151,17 +1151,114 @@ def test_note_session_title_ignores_blank_and_updates_only_changes(
     assert store.get_session_titles([GROUP_A]) == {GROUP_A: "New name"}
 
 
-def test_admin_id_membership_lookup_uses_current_space_and_platform(
+def test_admin_precheck_reports_unknown_ids_in_current_space_and_platform(
     service, store, space
 ):
     target = user("123456")
+    other_platform = UserRef("other", "123456")
     with store.transaction():
-        original = store.upsert_member(space.id, target, "Known")
-    assert service.get_member(OWNER, AUTO, target) == original
-    assert service.get_member(OWNER, AUTO, UserRef("other", "123456")) is None
+        store.upsert_member(space.id, target, "Known")
+    assert service.admin_precheck(OWNER, frozenset({target, other_platform})) == {
+        other_platform
+    }
     second = service.new_space(OWNER, "Second")
-    assert service.get_member(OWNER, AUTO, target) is None
+    assert service.admin_precheck(OWNER, frozenset({target})) == {target}
     assert store.get_member(second.id, target) is None
+
+
+def test_admin_precheck_denies_and_never_writes(service, store, space, monkeypatch):
+    def no_transaction():
+        raise AssertionError("the pre-check must not open a transaction")
+
+    monkeypatch.setattr(store, "transaction", no_transaction)
+    lookups = []
+    get_member = store.get_member
+
+    def recording_get_member(space_id, who):
+        lookups.append(who)
+        return get_member(space_id, who)
+
+    monkeypatch.setattr(store, "get_member", recording_get_member)
+    targets = frozenset(user(str(100000 + i)) for i in range(5))
+
+    with pytest.raises(TodoError, match=DENIAL_MESSAGES[Op.MANAGE_ADMINS]):
+        service.admin_precheck(MEMBER, targets)
+    assert lookups == [MEMBER.user]
+    # AstrBot admins pass everywhere, still without writing.
+    assert service.admin_precheck(actor("root", bot_admin=True), targets) == targets
+
+
+@pytest.mark.parametrize(
+    ("who", "allowed"),
+    [
+        (actor("pleb", GROUP_B), False),
+        (actor("ga", GROUP_B, admin=True), True),
+        (actor("u1", PRIVATE), True),
+    ],
+    ids=["member", "session-admin", "private"],
+)
+def test_admin_precheck_without_bound_space_mirrors_auto_space_owner(
+    service, store, who, allowed
+):
+    targets = frozenset({user("123456")})
+    if allowed:
+        assert service.admin_precheck(who, targets) == set(targets)
+    else:
+        with pytest.raises(TodoError, match=DENIAL_MESSAGES[Op.MANAGE_ADMINS]):
+            service.admin_precheck(who, targets)
+    assert store.list_bindings(who.session) == []
+
+
+def test_admin_raw_id_membership_is_decided_in_the_modified_space(
+    service, store, space
+):
+    """TOCTOU: membership of space A must not exempt a raw ID in space B."""
+    target = user("123456")
+    with store.transaction():
+        store.upsert_member(space.id, target, "Known")
+    assert service.admin_precheck(OWNER, frozenset({target})) == set()
+    second = service.new_space(OWNER, "Second")  # Current space switches to B.
+    baseline = store.list_space_events(second.id)
+    ops = AssignOps(None, (Mention(target, ""),), ())
+
+    with pytest.raises(
+        TodoError, match="找不到 QQ 号 123456：不是空间成员，也不在本群成员列表里"
+    ):
+        service.set_admins(OWNER, AUTO, ops, frozenset({target}), {}, "QQ 号")
+
+    assert store.get_member(second.id, target) is None
+    assert store.get_member(space.id, target).role == SpaceRole.MEMBER
+    assert store.list_space_events(second.id) == baseline
+
+
+def test_admin_verified_raw_id_joins_with_group_name(service, store, space):
+    target = user("123456")
+    ops = AssignOps(None, (Mention(target, ""),), ())
+
+    _, changed = service.set_admins(
+        OWNER, AUTO, ops, frozenset({target}), {target: "Group Card"}
+    )
+
+    assert changed == [store.get_member(space.id, target)]
+    assert changed[0].nickname == "Group Card"
+    assert changed[0].role == SpaceRole.ADMIN
+
+
+def test_admin_unverified_raw_id_rolls_back_mentions_and_uses_neutral_label(
+    service, store, space
+):
+    raw = user("123456")
+    ops = AssignOps(None, (mention("ghost"), Mention(raw, "")), (mention("member"),))
+    with store.transaction():
+        store.set_member_role(space.id, MEMBER.user, SpaceRole.ADMIN)
+    baseline = (store.list_members(space.id), store.list_space_events(space.id))
+
+    with pytest.raises(TodoError, match="^找不到 用户 ID 123456："):
+        service.set_admins(OWNER, AUTO, ops, frozenset({raw}), {user("999999"): "X"})
+
+    assert (store.list_members(space.id), store.list_space_events(space.id)) == (
+        baseline
+    )
 
 
 def test_admin_member_id_preserves_nickname_and_role_logs(service, store, space):

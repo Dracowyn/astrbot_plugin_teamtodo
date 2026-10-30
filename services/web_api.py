@@ -89,6 +89,10 @@ class InvalidInput(Exception):
     """Malformed request input; ``str(exc)`` is a Chinese message (HTTP 400)."""
 
 
+class NotReady(Exception):
+    """The service went away during an operation's await (HTTP 503)."""
+
+
 def _path_id(raw: object, label: str) -> int:
     """Parse a path id: ASCII decimal, 1..``MAX_ID``, no sign or spaces.
 
@@ -360,7 +364,8 @@ class WebApi:
 
         Path ids are validated, a POST body must be a JSON object, and the
         service is read after the body await so a concurrent ``terminate()``
-        cannot hand the operation a closed store.
+        cannot hand the operation a closed store. An operation that awaits
+        itself re-reads it the same way and raises ``NotReady`` when it is gone.
 
         Args:
             path: Route template, for the log.
@@ -389,6 +394,8 @@ class WebApi:
                 if isawaitable(result):
                     result = await result
                 return json_response(result)
+            except NotReady:
+                return error_response(NOT_READY, status_code=503)
             except InvalidInput as exc:
                 return error_response(str(exc), status_code=400)
             except NotFound as exc:
@@ -474,7 +481,11 @@ class WebApi:
     async def _sync_members(
         self, service: AdminService, body: dict, space_id: int
     ) -> dict[str, Any]:
-        """Sync each binding independently and return refreshed space details."""
+        """Sync each binding independently and return refreshed space details.
+
+        The service is re-read after every await; once ``terminate()`` has
+        cleared it the sync stops with ``NotReady`` (HTTP 503).
+        """
         detail = service.get_space(space_id)
         username = _username()
         total = 0
@@ -483,11 +494,20 @@ class WebApi:
             added = None
             error = None
             try:
-                members = await self._fetch_group_members(binding.session)
+                try:
+                    members = await self._fetch_group_members(binding.session)
+                finally:
+                    # Even after a failed fetch: stop before touching (or
+                    # fetching for) a service that terminate() has closed.
+                    service = self._get_service()
+                    if service is None:
+                        raise NotReady
                 added = service.sync_members(
                     username, space_id, binding.session, members
                 )
                 total += added
+            except NotReady:
+                raise
             except TodoError as exc:
                 error = str(exc)
             except Exception:

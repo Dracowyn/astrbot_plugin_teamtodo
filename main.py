@@ -33,14 +33,12 @@ from astrbot.core.star.session_plugin_manager import SessionPluginManager
 
 from .core.models import (
     Actor,
-    Mention,
     SpaceRole,
     Task,
     TaskStatus,
     TodoError,
 )
 from .core.parsing import (
-    AssignOps,
     Part,
     parse_admin,
     parse_assign,
@@ -490,32 +488,43 @@ class TeamTodoPlugin(Star):
     async def _admin(
         self, event: AstrMessageEvent, actor: Actor, auto_name: str, args: list[Part]
     ) -> str:
-        """Resolve raw additions before the synchronous role-update transaction."""
-        ops, raw_additions = parse_admin(args, actor.user.platform_id)
+        """Appoint or revoke admins of the current space (``/todo admin``).
+
+        A read-only permission pre-check denies non-owners before any member
+        lookup or group fetch, and takes precedence over usage errors (parsing
+        is pure and capped), so they get the same reply whatever they give.
+        The group is listed at most once, only when a raw added id is not yet
+        a member, and only the ids found there are passed on: ``set_admins``
+        decides membership inside its transaction, against the space it
+        actually modifies.
+
+        Args:
+            event: The command event (for the group member list).
+            actor: The requesting user.
+            auto_name: Base name for an auto-created space.
+            args: Parts after ``admin``.
+
+        Returns:
+            The roles of every target after the change.
+
+        Raises:
+            TodoError: Usage error, denial, or a rejected target.
+        """
+        try:
+            ops, raw = parse_admin(args, actor.user.platform_id)
+        except TodoError:
+            self._service.admin_precheck(actor, frozenset())
+            raise
+        unknown = self._service.admin_precheck(actor, raw)
         group = None
-        fetched = False
-        additions = []
-        for mention in ops.add:
-            if (
-                mention.user in raw_additions
-                and self._service.get_member(actor, auto_name, mention.user) is None
-            ):
-                if not fetched and event.get_group_id():
-                    group = await group_members.from_event(event)
-                    fetched = True
-                match = next(
-                    (member for member in group or () if member.user == mention.user),
-                    None,
-                )
-                if match is None:
-                    raise TodoError(
-                        f"找不到 QQ 号 {mention.user.user_id}："
-                        "不是空间成员，也不在本群成员列表里"
-                    )
-                mention = Mention(user=match.user, name=match.nickname)
-            additions.append(mention)
+        if unknown and event.get_group_id():
+            group = await group_members.from_event(event)
+        verified = {m.user: m.nickname for m in group or () if m.user in raw}
+        id_label = "QQ 号" if event.get_platform_name() == "aiocqhttp" else "用户 ID"
+        if self._service is None:  # terminate() ran during the fetch
+            raise TodoError(GENERIC_FAILURE)
         space, members = self._service.set_admins(
-            actor, auto_name, AssignOps(None, tuple(additions), ops.remove)
+            actor, auto_name, ops, raw, verified, id_label
         )
         lines = [
             f"{m.nickname or m.user.user_id}："

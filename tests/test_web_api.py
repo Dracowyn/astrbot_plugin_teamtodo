@@ -1012,3 +1012,90 @@ async def test_sync_members_uses_endpoint_validation(
         routes, "POST", "spaces/<space_id>/members/sync", body, space_id=space_id
     )
     assert status == expected
+
+
+class RecordingService:
+    """Proxies an ``AdminService`` and records which methods were called."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.calls = []
+
+    def __getattr__(self, name):
+        attr = getattr(self.inner, name)
+
+        def call(*args, **kwargs):
+            self.calls.append(name)
+            return attr(*args, **kwargs)
+
+        return call
+
+
+def sync_routes(holder, fetch):
+    api = web_api.WebApi(
+        lambda: holder["service"],
+        TZ,
+        fetch_group_members=fetch,
+        remind_before_minutes=60,
+        auto_archive_days=7,
+    )
+    return {(r.removeprefix(PREFIX), m[0]): h for r, h, m, _ in api.routes()}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True], ids=["fetched", "fetch-failed"])
+async def test_sync_members_stops_with_503_when_service_goes_away(
+    holder, seeded, store, fails
+):
+    """A terminate() during the fetch must not reach the captured service."""
+    with store.transaction():
+        store.bind("qq:GroupMessage:2000", 1)
+    old = RecordingService(holder["service"])
+    holder["service"] = old
+    fetched = []
+
+    async def fetch(session):
+        fetched.append(session)
+        holder["service"] = None
+        if fails:
+            raise RuntimeError("adapter failure")
+        return [GroupMember(UserRef("qq", "new"), "New", ("New",))]
+
+    status, reply = await send(
+        sync_routes(holder, fetch),
+        "POST",
+        "spaces/<space_id>/members/sync",
+        space_id="1",
+    )
+
+    assert status == 503
+    assert reply["message"] == web_api.NOT_READY
+    assert old.calls == ["get_space"]
+    assert len(fetched) == 1
+    assert store.get_member(1, UserRef("qq", "new")) is None
+
+
+@pytest.mark.asyncio
+async def test_sync_members_uses_the_service_read_after_each_fetch(
+    holder, seeded, store
+):
+    """A service replaced during the fetch is the one that syncs and answers."""
+    old = RecordingService(holder["service"])
+    new = RecordingService(AdminService(store, TZ, clock=lambda: NOW))
+    holder["service"] = old
+
+    async def fetch(session):
+        holder["service"] = new
+        return [GroupMember(UserRef("qq", "new"), "New", ("New",))]
+
+    status, reply = await send(
+        sync_routes(holder, fetch),
+        "POST",
+        "spaces/<space_id>/members/sync",
+        space_id="1",
+    )
+
+    assert status == 200
+    assert reply["added"] == 1
+    assert old.calls == ["get_space"]
+    assert new.calls == ["sync_members", "get_space"]

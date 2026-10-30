@@ -32,7 +32,6 @@ from ..core.models import (
     Space,
     SpaceEventAction,
     SpaceEventDraft,
-    SpaceRole,
     Task,
     TaskDraft,
     TaskStatus,
@@ -748,47 +747,53 @@ class TodoService:
             self._space_log(actor, space, SpaceEventAction.CLAIM, {})
             return claimed
 
-    def get_member(self, actor: Actor, auto_name: str, user: UserRef) -> Member | None:
-        """Read a member of the actor's current space by platform identity."""
-        with self._store.transaction():
-            space, _ = self._space(actor, auto_name, None)
-            return self._store.get_member(space.id, user)
+    def admin_precheck(self, actor: Actor, users: frozenset[UserRef]) -> set[UserRef]:
+        """Deny non-owners read-only (no transaction, no auto space, no fetch).
 
-    def set_admins(
-        self, actor: Actor, auto_name: str, ops: AssignOps
-    ) -> tuple[Space, list[Member]]:
-        """Appoint or revoke admins; unknown additions join before promotion.
+        Mirrors ``_current_space``; ``set_admins`` re-checks everything.
+        Returns the ``users`` that are not members of the current space.
 
         Raises:
-            TodoError: Bad usage, denied permission, unknown removal, or owner.
+            TodoError: The actor may not manage admins of the current space.
+        """
+        bound = [b.space_id for b in self._store.list_bindings(actor.session)]
+        first = (
+            self._store.get_current(actor.session, actor.user),
+            self._store.get_session_default(actor.session),
+        )
+        space_id = next((i for i in (*first, *bound) if i in bound), None)
+        if space_id is None:  # A new auto space would be owned as below.
+            allowed = actor.is_bot_admin or actor.is_private or actor.is_session_admin
+            perms.require(allowed, perms.Op.MANAGE_ADMINS)
+            return set(users)
+        member = self._store.get_member(space_id, actor.user)
+        space = self._store.get_space(space_id)
+        perms.require(
+            perms.can_manage_admins(actor, member, space), perms.Op.MANAGE_ADMINS
+        )
+        return {u for u in users if self._store.get_member(space_id, u) is None}
+
+    def set_admins(
+        self,
+        actor: Actor,
+        auto_name: str,
+        ops: AssignOps,
+        raw: frozenset[UserRef] = frozenset(),
+        verified: dict[UserRef, str] | None = None,
+        id_label: str = "用户 ID",
+    ) -> tuple[Space, list[Member]]:
+        """Appoint or revoke admins atomically; see ``task_ops.set_roles``.
+
+        Raises:
+            TodoError: Bad usage, denied permission, or a rejected target.
         """
         if ops.replace is not None:
-            raise TodoError("用法：/todo admin +@某人 / -@某人 或 +QQ号 / -QQ号")
+            raise TodoError("用法：/todo admin +@某人 / -@某人 或 +用户ID / -用户ID")
         with self._store.transaction():
             space, member = self._space(actor, auto_name, None)
             perms.require(
                 perms.can_manage_admins(actor, member, space), perms.Op.MANAGE_ADMINS
             )
-            changed = []
-            for mention, role in [(m, SpaceRole.ADMIN) for m in ops.add] + [
-                (m, SpaceRole.MEMBER) for m in ops.remove
-            ]:
-                target = self._store.get_member(space.id, mention.user)
-                if target is None and role == SpaceRole.ADMIN:
-                    target = self._store.upsert_member(
-                        space.id, mention.user, mention.name
-                    )
-                if target is None:
-                    label = mention.name or mention.user.user_id
-                    raise TodoError(f"{label} 还不是这个空间的成员")
-                if target.role == SpaceRole.OWNER or target.user == space.owner:
-                    raise TodoError("不能修改所有者的角色")
-                changed.append(self._store.set_member_role(space.id, target.user, role))
-                if target.role != role:
-                    self._space_log(
-                        actor,
-                        space,
-                        SpaceEventAction.ROLE,
-                        {"user": target.user.key, "role": [target.role, role]},
-                    )
-            return space, changed
+            return space, task_ops.set_roles(
+                self._store, space, ops, actor, raw, verified or {}, id_label
+            )
