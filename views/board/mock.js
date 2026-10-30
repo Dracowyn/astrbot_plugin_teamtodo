@@ -1,18 +1,19 @@
-// In-memory stand-in for the plugin's REST backend. `request(method, endpoint, payload)` implements the
-// contract documented at the top of api.js; replacing api.js `send()` with the AstrBot bridge is the only
-// change needed in M3. Everything crosses a JSON boundary, like the real wire.
-import { EVENTS, SHARE_BASE_PATH, SPACES, TASKS, TIMEZONE } from "./mock-data.js";
-import { LIMITS, isOverdue, nowSeconds, userKey } from "./format.js";
+// In-memory stand-in for the plugin's REST backend, used when the AstrBot bridge is absent (standalone demo).
+// `request(method, endpoint, payload)` implements the contract in docs/design.md section 7. Everything crosses a
+// JSON boundary, like the real wire. Demo-only switch: `?mockFail=<substring of "METHOD endpoint">` makes
+// matching calls reject, e.g. `?mockFail=POST spaces/1/tasks/3` (used to exercise error display and rollback).
+import { EVENTS, SPACES, TASKS, TIMEZONE, WEBUI_USER } from "./mock-data.js";
+import { LIMITS, PRIORITY_LABEL, STATUS_LABEL, formatDateTime, isOverdue, nowSeconds, userKey } from "./format.js";
 
 const LATENCY_MS = 70;
 const INVITE_TTL_SECONDS = 7 * 86400;
 const INVITE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const ADMIN_LABEL = "admin（WebUI）";
+const MOCK_FAIL = new URLSearchParams(location.search).get("mockFail");
 
 const spaces = clone(SPACES);
 const tasks = clone(TASKS);
 const events = clone(EVENTS);
-let nextEventId = Math.max(...events.map((e) => e.id)) + 1;
 
 function fail(status, message) {
   throw Object.assign(new Error(message), { status });
@@ -27,7 +28,6 @@ function randomString(alphabet, length) {
   const bytes = crypto.getRandomValues(new Uint8Array(length));
   return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("");
 }
-const URL_SAFE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 function getSpace(id) {
   const space = spaces.find((s) => s.id === Number(id));
@@ -39,13 +39,6 @@ function getTask(spaceId, seq) {
   const found = tasks.find((t) => t.space_id === Number(spaceId) && t.seq === Number(seq));
   if (!found) fail(404, "任务不存在");
   return found;
-}
-
-function shareUrl(space) {
-  if (!space.share.enabled) return null;
-  const url = new URL(SHARE_BASE_PATH, location.href);
-  url.searchParams.set("t", space.share.token);
-  return url.href;
 }
 
 function summarize(space) {
@@ -62,7 +55,6 @@ function summarize(space) {
     member_count: space.members.length,
     task_counts: counts,
     overdue_count: own.filter((t) => isOverdue(t, now)).length,
-    shared: space.share.enabled,
   };
 }
 
@@ -71,17 +63,17 @@ function detail(space) {
     ...summarize(space),
     bindings: space.bindings,
     members: space.members,
-    invite: space.invite ? { active: space.invite.expires_at > nowSeconds(), expires_at: space.invite.expires_at } : null,
-    share: { enabled: space.share.enabled, url: shareUrl(space) },
+    invite: space.invite && space.invite.expires_at > nowSeconds() ? { expires_at: space.invite.expires_at } : null,
   };
 }
 
-function log(spaceId, taskSeq, action, detailBody) {
-  events.push({
-    id: nextEventId++, space_id: spaceId, task_seq: taskSeq, action, detail: detailBody,
-    actor: null, actor_label: ADMIN_LABEL, session: "", created_at: nowSeconds(),
-  });
+/** Appends an operation-log entry; `summary` is the already-rendered sentence (the real server renders it). */
+function log(spaceId, taskSeq, action, summary) {
+  events.push({ space_id: spaceId, kind: taskSeq == null ? "space" : "task", task_seq: taskSeq, action, summary, actor_name: ADMIN_LABEL, created_at: nowSeconds() });
 }
+
+const publicEvent = ({ space_id, ...rest }) => rest;
+const publicTask = (task) => ({ ...task, overdue: isOverdue(task, nowSeconds()) });
 
 // ---- validation (the real backend enforces the same limits for every entry point) ----
 
@@ -139,7 +131,6 @@ function applyPatch(space, task, patch) {
   if ("tags" in patch) set("tags", cleanTags(patch.tags));
   if ("due_at" in patch) {
     set("due_at", patch.due_at ?? null);
-    if (changes.due_at) task.reminded = false;
   }
   const before = task.assignees.map((a) => a.nickname);
   if ("assignees" in patch) {
@@ -160,17 +151,35 @@ function applyPatch(space, task, patch) {
   return changes;
 }
 
+const dueText = (value) => (value == null ? "无" : formatDateTime(value));
+const FIELD_SUMMARY = {
+  title: ([, next]) => `标题改为「${next}」`,
+  description: () => "修改了描述",
+  due_at: ([old, next]) => `截止时间 ${dueText(old)} → ${dueText(next)}`,
+  priority: ([old, next]) => `优先级 ${old ? PRIORITY_LABEL[old] : "无"} → ${next ? PRIORITY_LABEL[next] : "无"}`,
+  tags: ([old, next]) => `标签 ${old.join("、") || "无"} → ${next.join("、") || "无"}`,
+};
+
 function recordChanges(task, changes) {
   const { status, assignees, ...fields } = changes;
-  if (status) log(task.space_id, task.seq, status[1] === "archived" ? "archive" : "status", { status });
-  if (assignees) log(task.space_id, task.seq, "assign", assignees);
-  if (Object.keys(fields).length) log(task.space_id, task.seq, "update", fields);
+  const write = (action, summary) => log(task.space_id, task.seq, action, summary);
+  if (status) {
+    write(status[1] === "archived" ? "archive" : "status", status[1] === "archived" ? "归档了任务" : `将状态由 ${STATUS_LABEL[status[0]]} 改为 ${STATUS_LABEL[status[1]]}`);
+  }
+  if (assignees) {
+    const parts = [];
+    if (assignees.added.length) parts.push(`指派给 ${assignees.added.join("、")}`);
+    if (assignees.removed.length) parts.push(`取消了 ${assignees.removed.join("、")} 的指派`);
+    write("assign", parts.join("，"));
+  }
+  const text = Object.entries(fields).map(([field, change]) => FIELD_SUMMARY[field](change)).join("；");
+  if (text) write("update", text);
 }
 
 function createTask(space, body) {
   const task = {
     space_id: space.id,
-    seq: Math.max(0, ...tasks.filter((t) => t.space_id === space.id).map((t) => t.seq), ...events.filter((e) => e.space_id === space.id).map((e) => e.task_seq)) + 1,
+    seq: Math.max(0, ...tasks.filter((t) => t.space_id === space.id).map((t) => t.seq), ...events.filter((e) => e.space_id === space.id).map((e) => e.task_seq ?? 0)) + 1,
     title: cleanTitle(body.title),
     status: "todo",
     assignees: cleanAssignees(space, body.assignees),
@@ -178,22 +187,19 @@ function createTask(space, body) {
     tags: cleanTags(body.tags),
     priority: cleanPriority(body.priority),
     description: cleanDescription(body.description),
-    creator: { platform_id: "webui", user_id: "admin", nickname: ADMIN_LABEL },
-    created_session: "",
+    creator: { ...WEBUI_USER },
     created_at: nowSeconds(),
     updated_at: nowSeconds(),
     done_at: null,
-    reminded: false,
   };
   tasks.push(task);
-  log(space.id, task.seq, "create", { title: task.title });
+  log(space.id, task.seq, "create", `创建了任务「${task.title}」`);
   return task;
 }
 
 function removeTask(space, task) {
   tasks.splice(tasks.indexOf(task), 1);
-  const { seq, title, status, assignees, tags, due_at, priority, description } = task;
-  log(space.id, seq, "delete", { snapshot: { seq, title, status, assignees: assignees.map((a) => a.nickname), tags, due_at, priority, description } });
+  log(space.id, task.seq, "delete", `删除了任务「${task.title}」`);
 }
 
 // ---- space mutations ----
@@ -204,15 +210,7 @@ function setRole(space, body) {
   if (target.role === "owner") fail(400, "不能修改所有者的角色");
   if (!["admin", "member"].includes(body.role)) fail(400, "角色无效");
   target.role = body.role;
-}
-
-function setShare(space, action) {
-  if (action === "on") space.share.enabled = true;
-  else if (action === "off") space.share.enabled = false;
-  else if (action === "reset") {
-    space.share.token = randomString(URL_SAFE, 22);
-    space.share.enabled = true;
-  } else fail(400, "操作无效");
+  log(space.id, null, "role", body.role === "admin" ? `任命 ${target.nickname} 为管理员` : `撤销了 ${target.nickname} 的管理员`);
 }
 
 function rename(space, value) {
@@ -220,6 +218,7 @@ function rename(space, value) {
   if (!name) fail(400, "空间名不能为空");
   if ([...name].length > LIMITS.spaceName) fail(400, `空间名最多 ${LIMITS.spaceName} 字`);
   space.name = name;
+  log(space.id, null, "rename", `将空间重命名为「${name}」`);
 }
 
 // ---- public board ----
@@ -238,8 +237,10 @@ function publicBoard(token) {
 
 // ---- router ----
 
+const META_LIMITS = { title: LIMITS.title, description: LIMITS.description, tag: LIMITS.tag, tags: LIMITS.tags, assignees: LIMITS.assignees, space_name: LIMITS.spaceName };
+
 const routes = [
-  ["GET", /^meta$/, () => ({ timezone: TIMEZONE, server_time: nowSeconds(), auto_archive_days: 7, limits: LIMITS })],
+  ["GET", /^meta$/, () => ({ timezone: TIMEZONE, server_time: nowSeconds(), auto_archive_days: 7, remind_before_minutes: 30, limits: META_LIMITS })],
   ["GET", /^spaces$/, () => ({ spaces: spaces.map(summarize) })],
   ["GET", /^spaces\/(\d+)$/, (m) => detail(getSpace(m[1]))],
   ["POST", /^spaces\/(\d+)\/rename$/, (m, body) => { const s = getSpace(m[1]); rename(s, body.name); return detail(s); }],
@@ -253,24 +254,25 @@ const routes = [
     const s = getSpace(m[1]);
     if (!s.bindings.some((b) => b.session === body.session)) fail(404, "该会话未绑定此空间");
     s.bindings = s.bindings.filter((b) => b.session !== body.session);
+    log(s.id, null, "unbind", `解绑了会话 ${body.session}`);
     return detail(s);
   }],
   ["POST", /^spaces\/(\d+)\/members\/role$/, (m, body) => { const s = getSpace(m[1]); setRole(s, body); return detail(s); }],
   ["POST", /^spaces\/(\d+)\/invite\/reset$/, (m) => {
     const s = getSpace(m[1]);
     s.invite = { expires_at: nowSeconds() + INVITE_TTL_SECONDS };
+    log(s.id, null, "invite", "重置了邀请码");
     return { code: randomString(INVITE_ALPHABET, 12), expires_at: s.invite.expires_at };
   }],
-  ["POST", /^spaces\/(\d+)\/share$/, (m, body) => { const s = getSpace(m[1]); setShare(s, body.action); return { enabled: s.share.enabled, url: shareUrl(s) }; }],
   ["GET", /^spaces\/(\d+)\/tasks$/, (m, params) => {
     const s = getSpace(m[1]);
     const include = [true, 1, "1"].includes(params.include_archived);
-    return { tasks: tasks.filter((t) => t.space_id === s.id && (include || t.status !== "archived")), server_time: nowSeconds() };
+    return { tasks: tasks.filter((t) => t.space_id === s.id && (include || t.status !== "archived")).map(publicTask), server_time: nowSeconds() };
   }],
-  ["POST", /^spaces\/(\d+)\/tasks$/, (m, body) => createTask(getSpace(m[1]), body)],
+  ["POST", /^spaces\/(\d+)\/tasks$/, (m, body) => publicTask(createTask(getSpace(m[1]), body))],
   ["GET", /^spaces\/(\d+)\/tasks\/(\d+)$/, (m) => {
     const t = getTask(m[1], m[2]);
-    return { task: t, events: events.filter((e) => e.space_id === t.space_id && e.task_seq === t.seq).sort((a, b) => b.created_at - a.created_at) };
+    return { task: publicTask(t), events: events.filter((e) => e.space_id === t.space_id && e.task_seq === t.seq).sort((a, b) => b.created_at - a.created_at).map(publicEvent) };
   }],
   ["POST", /^spaces\/(\d+)\/tasks\/(\d+)$/, (m, body) => {
     const s = getSpace(m[1]);
@@ -280,13 +282,13 @@ const routes = [
       t.updated_at = nowSeconds();
       recordChanges(t, changes);
     }
-    return t;
+    return publicTask(t);
   }],
   ["POST", /^spaces\/(\d+)\/tasks\/(\d+)\/delete$/, (m) => { removeTask(getSpace(m[1]), getTask(m[1], m[2])); return { ok: true }; }],
   ["GET", /^spaces\/(\d+)\/events$/, (m, params) => {
     const s = getSpace(m[1]);
     const limit = Math.min(Number(params.limit) || 50, 200);
-    return { events: events.filter((e) => e.space_id === s.id).sort((a, b) => b.created_at - a.created_at).slice(0, limit) };
+    return { events: events.filter((e) => e.space_id === s.id).sort((a, b) => b.created_at - a.created_at).slice(0, limit).map(publicEvent) };
   }],
   ["GET", /^b\/([^/]+)\/api\/board$/, (m) => publicBoard(m[1])],
 ];
@@ -294,6 +296,7 @@ const routes = [
 /** @returns {Promise<any>} JSON-like response body; rejects with Error(message) carrying `.status`. */
 export async function request(method, endpoint, payload = {}) {
   await new Promise((resolve) => setTimeout(resolve, LATENCY_MS));
+  if (MOCK_FAIL && `${method} ${endpoint}`.includes(MOCK_FAIL)) throw new Error("模拟的服务器错误：操作失败");
   for (const [routeMethod, pattern, handler] of routes) {
     const match = routeMethod === method && pattern.exec(endpoint);
     if (match) return clone(handler(match, clone(payload)));

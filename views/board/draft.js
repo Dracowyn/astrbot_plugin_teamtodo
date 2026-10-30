@@ -32,4 +32,21 @@ export function fieldsFromDraft(draft, members) {
   };
 }
 
+/**
+ * Patch for POST tasks/<seq>: only fields that differ from `original`. Cleared due date / priority become null
+ * (the server clears them); assignees and tags are sent as whole lists (the server replaces them).
+ */
+export function patchFromDraft(draft, original, members) {
+  const next = fieldsFromDraft(draft, members);
+  const before = fieldsFromDraft(original, members);
+  const patch = {};
+  for (const key of Object.keys(next)) {
+    if (JSON.stringify(next[key]) !== JSON.stringify(before[key])) patch[key] = next[key];
+  }
+  // Selection keys are what the user edits; compare them directly so non-member assignees do not hide changes.
+  if (JSON.stringify(draft.assigneeKeys) === JSON.stringify(original.assigneeKeys)) delete patch.assignees;
+  else patch.assignees = next.assignees;
+  return patch;
+}
+
 export const isSameDraft = (a, b) => JSON.stringify(a) === JSON.stringify(b);

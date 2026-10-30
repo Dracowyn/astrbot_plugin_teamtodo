@@ -2,7 +2,7 @@
 // components from the same directory; until then it runs on mock data (token from ?t=).
 import { computed, createApp, onBeforeUnmount, onMounted, ref } from "./vue.js";
 import { getPublicBoard } from "./api.js";
-import { STATUSES, formatRelative, nowSeconds, setTimeZone } from "./format.js";
+import { STATUSES, formatRelative, initial, nowSeconds, setTimeZone, tagColor } from "./format.js";
 import KanbanBoard from "./components/board.js";
 import RefreshIndicator from "./components/refresh-indicator.js";
 
@@ -99,20 +99,21 @@ const App = {
 
     return {
       board, state, errorMessage, linkClosed, refreshFailed, refreshing, cycle, now, counts, total, activeColumn, boardWrap,
-      STATUSES, REFRESH_SECONDS, formatRelative, goToColumn, onBoardScroll, load,
+      STATUSES, REFRESH_SECONDS, formatRelative, initial, tagColor, goToColumn, onBoardScroll, load,
     };
   },
   template: `
     <div class="pub">
+      <div class="pub-cover" aria-hidden="true"></div>
       <header class="pub-head">
-        <p class="pub-brand">团队待办 · 公开看板</p>
+        <span class="page-icon pub-icon" :class="'c-' + tagColor(board ? board.space.name : 'x')" aria-hidden="true">{{ board ? initial(board.space.name) : '·' }}</span>
         <h1 class="pub-title">{{ board ? board.space.name : state === 'error' ? '无法打开看板' : '加载中…' }}</h1>
         <p v-if="board" class="pub-meta">
-          <span class="num">共 {{ total }} 项，进行中 {{ counts.doing }}，已完成 {{ counts.done }}</span>
-          <span class="pub-sep" aria-hidden="true">·</span>
+          <span class="num">共 {{ total }} 项</span>
+          <span class="num">进行中 {{ counts.doing }}</span>
+          <span class="num">已完成 {{ counts.done }}</span>
           <span>更新于 <time class="num">{{ formatRelative(board.updated_at, now) }}</time></span>
         </p>
-        <RefreshIndicator v-if="board" :cycle="cycle" :seconds="REFRESH_SECONDS" :refreshing="refreshing" :failed="refreshFailed" />
       </header>
 
       <main class="pub-main" ref="boardWrap" @scroll.capture="onBoardScroll">
@@ -133,7 +134,10 @@ const App = {
         </template>
       </main>
 
-      <footer class="pub-foot">只读视图，仅显示昵称。需要修改请在群里使用 /todo 命令。</footer>
+      <footer class="pub-foot">
+        <p class="pub-foot-line"><span>只读看板</span><span aria-hidden="true">·</span><RefreshIndicator v-if="board" :cycle="cycle" :seconds="REFRESH_SECONDS" :refreshing="refreshing" :failed="refreshFailed" /><span v-else>每 {{ REFRESH_SECONDS }} 秒刷新</span></p>
+        <p class="pub-foot-note">仅显示昵称。需要修改请在群里使用 /todo 命令。</p>
+      </footer>
     </div>
   `,
 };

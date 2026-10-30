@@ -1,13 +1,16 @@
-// One task entry: number in a left gutter, title, then a single meta line (names · due · tags).
-// Shared by the admin board (editable: click/Enter opens the drawer, draggable) and the public board
-// (read-only: the description can be expanded in place). Overdue has exactly one signal: the due text.
+// One task card: title, then a row of small properties (number, priority, tags, due, people).
+// Shared by the admin board (editable: click/Enter opens the side peek, draggable) and the public board
+// (read-only: the description can be expanded in place). Overdue has exactly one signal: red due text
+// (admin: the server's `overdue` flag; public board: computed client-side until M4).
 import { computed, ref } from "../vue.js";
-import { STATUS_LABEL, formatDue, isOverdue, userKey } from "../format.js";
+import { PRIORITY_COLOR, PRIORITY_LABEL, STATUS_LABEL, formatDue, isOverdue, tagColor } from "../format.js";
+import Avatar from "./avatar.js";
+import Pill from "./pill.js";
 import RichText from "./rich-text.js";
 
 export default {
   name: "TaskCard",
-  components: { RichText },
+  components: { Avatar, Pill, RichText },
   props: {
     task: { type: Object, required: true },
     now: { type: Number, required: true },
@@ -16,9 +19,8 @@ export default {
   emits: ["open", "move-key"],
   setup(props, { emit }) {
     const expanded = ref(false);
-    const overdue = computed(() => isOverdue(props.task, props.now));
+    const overdue = computed(() => (props.editable ? props.task.overdue === true : isOverdue(props.task, props.now)));
     const dueText = computed(() => (props.task.due_at == null ? "" : formatDue(props.task.due_at, props.now)));
-    const names = computed(() => props.task.assignees.map((a) => a.nickname).join("、"));
     const label = computed(() => `#${props.task.seq} ${props.task.title}，${STATUS_LABEL[props.task.status]}`);
 
     function onKeydown(event) {
@@ -32,32 +34,32 @@ export default {
       }
     }
 
-    return { expanded, overdue, dueText, names, label, onKeydown, userKey };
+    return { expanded, overdue, dueText, label, onKeydown, PRIORITY_COLOR, PRIORITY_LABEL, tagColor };
   },
   template: `
     <li class="card" :class="{ 'is-editable': editable, 'is-done': task.status === 'done', 'is-archived': task.status === 'archived' }"
         :data-seq="task.seq" :tabindex="editable ? 0 : undefined" :aria-label="editable ? label : undefined"
         :aria-keyshortcuts="editable ? 'Alt+ArrowLeft Alt+ArrowRight' : undefined"
         @click="editable && $emit('open', task.seq)" @keydown="editable && onKeydown($event)">
-      <span class="card-seq num">#{{ task.seq }}</span>
-      <div class="card-main">
-        <div class="card-line">
-          <p class="card-title">{{ task.title }}</p>
-          <span v-if="task.priority === 'high'" class="prio" aria-hidden="true">▲</span>
-          <span v-if="task.priority === 'high'" class="visually-hidden">高优先级</span>
-        </div>
-        <p v-if="names || task.due_at != null || task.tags.length" class="card-meta">
-          <span v-if="names" class="card-names"><span class="visually-hidden">负责人 </span>{{ names }}</span>
-          <span v-if="task.due_at != null" class="num" :class="{ 'is-overdue': overdue }"><span class="visually-hidden">截止 </span>{{ dueText }}<template v-if="overdue"> 逾期</template></span>
-          <span v-if="task.tags.length" class="card-tags"><span v-for="tag in task.tags" :key="tag">#{{ tag }}</span></span>
-        </p>
-        <template v-if="!editable && task.description">
-          <RichText :text="task.description" class="card-desc" :class="{ 'is-clamped': !expanded }" />
-          <button type="button" class="card-toggle" :aria-expanded="expanded" @click="expanded = !expanded">
-            {{ expanded ? '收起描述' : '展开描述' }}
-          </button>
-        </template>
+      <p class="card-title">{{ task.title }}</p>
+      <div class="card-props">
+        <span class="card-seq num">#{{ task.seq }}</span>
+        <Pill v-if="task.priority" :color="PRIORITY_COLOR[task.priority]"><span class="visually-hidden">优先级 </span>{{ PRIORITY_LABEL[task.priority] }}</Pill>
+        <Pill v-for="tag in task.tags" :key="tag" :color="tagColor(tag)">{{ tag }}</Pill>
+        <span v-if="task.due_at != null" class="card-due num" :class="{ 'is-overdue': overdue }"><span class="visually-hidden">截止 </span>{{ dueText }}<span v-if="overdue" class="visually-hidden"> 逾期</span></span>
+        <span v-if="task.assignees.length" class="card-people">
+          <span class="visually-hidden">负责人 {{ task.assignees.map((a) => a.nickname).join('、') }}</span>
+          <Avatar v-for="a in task.assignees.slice(0, 4)" :key="a.platform_id + a.user_id" :name="a.nickname" />
+          <span v-if="task.assignees.length > 4" class="card-more num" aria-hidden="true">+{{ task.assignees.length - 4 }}</span>
+          <span v-if="task.assignees.length === 1" class="card-name" aria-hidden="true">{{ task.assignees[0].nickname }}</span>
+        </span>
       </div>
+      <template v-if="!editable && task.description">
+        <RichText :text="task.description" class="card-desc" :class="{ 'is-clamped': !expanded }" />
+        <button type="button" class="card-toggle" :aria-expanded="expanded" @click="expanded = !expanded">
+          {{ expanded ? '收起描述' : '展开描述' }}
+        </button>
+      </template>
     </li>
   `,
 };

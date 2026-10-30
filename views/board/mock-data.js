@@ -1,4 +1,4 @@
-// Seed data for the in-memory mock server (mock.js). Shapes mirror core/models.py:
+// Seed data for the in-memory mock server (mock.js). Shapes mirror docs/design.md section 7:
 // users are {platform_id, user_id, nickname}; times are Unix seconds. All offsets are relative to "now"
 // so the demo always shows realistic overdue / due-soon cards.
 import { fromInputParts, toInputParts, nowSeconds } from "./format.js";
@@ -16,8 +16,8 @@ function dueAt(days, time) {
 const ago = (hours) => NOW - Math.round(hours * HOUR);
 
 export const TIMEZONE = "Asia/Shanghai";
-export const SHARE_BASE_PATH = "public.html";
 
+export const WEBUI_USER = { platform_id: "webui", user_id: "admin", nickname: "admin" };
 const user = (platform_id, user_id, nickname) => ({ platform_id, user_id, nickname });
 export const USERS = {
   yutong: user("aiocqhttp", "3318052741", "林雨桐"),
@@ -43,8 +43,8 @@ export const SPACES = [
     owner: USERS.yutong,
     created_at: NOW - 21 * DAY,
     bindings: [
-      { session: GROUP_A, bound_at: NOW - 21 * DAY },
-      { session: GROUP_B, bound_at: NOW - 9 * DAY },
+      { session: GROUP_A, title: "计网课设 · 第三组", bound_at: NOW - 21 * DAY },
+      { session: GROUP_B, title: null, bound_at: NOW - 9 * DAY },
     ],
     members: [
       member(USERS.yutong, "owner", 21),
@@ -64,7 +64,7 @@ export const SPACES = [
     name: "我的任务",
     owner: USERS.yutong,
     created_at: NOW - 40 * DAY,
-    bindings: [{ session: PRIVATE_YUTONG, bound_at: NOW - 40 * DAY }],
+    bindings: [{ session: PRIVATE_YUTONG, title: "林雨桐", bound_at: NOW - 40 * DAY }],
     members: [member(USERS.yutong, "owner", 40)],
     invite: null,
     share: { enabled: false, token: "Qm7dJ2xKp9VwR4tYe1NsLc" },
@@ -94,11 +94,9 @@ function task(spaceId, seq, fields) {
     priority: fields.priority ?? null,
     description: fields.description ?? "",
     creator: fields.creator,
-    created_session: fields.session ?? GROUP_A,
     created_at: createdAt,
     updated_at: fields.updated ?? createdAt,
     done_at: fields.done ?? null,
-    reminded: fields.reminded ?? false,
   };
 }
 
@@ -121,6 +119,7 @@ export const TASKS = [
   task(1, 10, { title: "部署到校内服务器并配置域名", assignees: [USERS.mingzhe], tags: ["运维"], priority: "high", due: dueAt(-2, "20:00"), creator: USERS.yutong, created: ago(7 * 24), updated: ago(40) }),
   task(1, 11, { title: "商品搜索与分页", status: "doing", assignees: [USERS.jiayi, USERS.eric], tags: ["前端", "后端"], priority: "medium", due: dueAt(3, "21:00"), creator: USERS.siyuan, session: GROUP_B, created: ago(2 * 24), updated: ago(6) }),
   task(1, 12, { title: "整理参考文献格式", status: "done", assignees: [USERS.zixuan], tags: ["文档"], creator: USERS.zixuan, created: ago(4 * 24), done: ago(26), updated: ago(26) }),
+  task(1, 14, { title: "补充压力测试报告", assignees: [USERS.mingzhe], tags: ["测试"], priority: "low", due: dueAt(6, "18:00"), creator: WEBUI_USER, created: ago(10) }),
   task(1, 13, { title: "周会纪要 10-26", status: "archived", tags: ["会议"], creator: USERS.yutong, created: NOW - 5 * DAY, done: NOW - 4 * DAY, updated: NOW - 2 * DAY }),
 
   task(2, 1, { title: "交《操作系统》实验报告", status: "doing", assignees: [USERS.yutong], priority: "high", due: dueAt(0, "23:59"), creator: USERS.yutong, session: PRIVATE_YUTONG, created: ago(50), updated: ago(5) }),
@@ -137,33 +136,36 @@ export const TASKS = [
   task(3, 4, { title: "采购易拉宝和桌布", assignees: [USERS.mingzhe], tags: ["物资"], priority: "medium", due: dueAt(-1, "12:00"), creator: USERS.jiayi, session: GROUP_B, created: ago(5 * 24), updated: ago(30) }),
 ];
 
-// Operation log. detail: create {title}; update {field: [old, new]}; status {status: [old, new]};
-// assign {added: [nickname], removed: [nickname]}; archive {reason}; delete {snapshot}.
-let eventId = 0;
-const event = (space_id, task_seq, action, detail, actor, hoursAgo, session = GROUP_A) => ({
-  id: ++eventId, space_id, task_seq, action, detail, actor, actor_label: "", session: actor ? session : "", created_at: ago(hoursAgo),
+// Operation log, newest-first on the wire. Shape: {kind: "task"|"space", task_seq: number|null, action, summary,
+// actor_name, created_at}. The server renders `summary` and `actor_name`; the UI never parses anything else.
+const event = (task_seq, action, summary, actor_name, hoursAgo) => ({
+  space_id: 1, kind: task_seq == null ? "space" : "task", task_seq, action, summary, actor_name, created_at: ago(hoursAgo),
 });
+const spaceEvent = (space_id, action, summary, actor_name, hoursAgo) => ({ ...event(null, action, summary, actor_name, hoursAgo), space_id });
+const otherEvent = (space_id, task_seq, action, summary, actor_name, hoursAgo) => ({ ...event(task_seq, action, summary, actor_name, hoursAgo), space_id });
 
 export const EVENTS = [
-  event(1, 3, "create", { title: "数据库 E-R 图设计" }, USERS.yutong, 6 * 24),
-  event(1, 3, "assign", { added: ["陈思远"], removed: [] }, USERS.yutong, 6 * 24),
-  event(1, 3, "assign", { added: ["王浩然"], removed: [] }, USERS.siyuan, 4 * 24),
-  event(1, 3, "status", { status: ["todo", "doing"] }, USERS.siyuan, 3 * 24),
-  event(1, 3, "update", { due_at: [null, dueAt(1, "18:00")], priority: [null, "high"] }, USERS.yutong, 26),
-  event(1, 3, "update", { due_at: [dueAt(1, "18:00"), dueAt(2, "18:00")] }, USERS.siyuan, 3),
-  event(1, 4, "create", { title: "登录注册接口（含学号校验）" }, USERS.siyuan, 5 * 24),
-  event(1, 4, "status", { status: ["todo", "doing"] }, USERS.haoran, 3 * 24 + 5),
-  event(1, 4, "update", { title: ["登录注册接口", "登录注册接口（含学号校验）"] }, USERS.siyuan, 20),
-  event(1, 6, "status", { status: ["doing", "done"] }, USERS.mingzhe, 2 * 24),
-  event(1, 9, "delete", { snapshot: { seq: 9, title: "重复的任务：画原型图", status: "todo", assignees: ["许嘉怡"], tags: ["前端"] } }, USERS.siyuan, 3 * 24 + 8),
-  event(1, 10, "create", { title: "部署到校内服务器并配置域名" }, USERS.yutong, 7 * 24),
-  event(1, 10, "assign", { added: ["刘明哲"], removed: [] }, USERS.yutong, 7 * 24),
-  event(1, 11, "create", { title: "商品搜索与分页" }, USERS.siyuan, 2 * 24, GROUP_B),
-  event(1, 11, "status", { status: ["todo", "doing"] }, USERS.jiayi, 6, GROUP_B),
-  event(1, 12, "status", { status: ["doing", "done"] }, USERS.zixuan, 26),
-  event(1, 1, "archive", { reason: "auto" }, null, 5 * 24),
-  event(1, 13, "archive", { reason: "manual" }, USERS.yutong, 2 * 24),
-  event(2, 1, "status", { status: ["todo", "doing"] }, USERS.yutong, 5, PRIVATE_YUTONG),
-  event(3, 4, "update", { priority: [null, "medium"] }, USERS.jiayi, 30, GROUP_B),
+  event(3, "create", "创建了任务「数据库 E-R 图设计」", "林雨桐", 6 * 24),
+  event(3, "assign", "指派给 陈思远", "林雨桐", 6 * 24),
+  event(3, "assign", "指派给 王浩然", "陈思远", 4 * 24),
+  event(3, "status", "将状态由 待办 改为 进行中", "陈思远", 3 * 24),
+  event(3, "update", "设置了优先级 高和截止时间", "林雨桐", 26),
+  event(3, "update", "截止时间已调整", "陈思远", 3),
+  event(4, "create", "创建了任务「登录注册接口（含学号校验）」", "陈思远", 5 * 24),
+  event(4, "status", "将状态由 待办 改为 进行中", "王浩然", 3 * 24 + 5),
+  event(4, "update", "标题改为「登录注册接口（含学号校验）」", "陈思远", 20),
+  event(6, "status", "将状态由 进行中 改为 已完成", "刘明哲", 2 * 24),
+  event(9, "delete", "删除了任务「重复的任务：画原型图」", "陈思远", 3 * 24 + 8),
+  event(10, "create", "创建了任务「部署到校内服务器并配置域名」", "林雨桐", 7 * 24),
+  event(11, "create", "创建了任务「商品搜索与分页」", "陈思远", 2 * 24),
+  event(11, "status", "将状态由 待办 改为 进行中", "许嘉怡", 6),
+  event(12, "status", "将状态由 进行中 改为 已完成", "赵梓萱", 26),
+  event(1, "archive", "任务完成满期，已自动归档", "系统", 5 * 24),
+  event(13, "archive", "归档了任务", "林雨桐", 2 * 24),
+  event(14, "create", "创建了任务「补充压力测试报告」", "admin（WebUI）", 10),
+  spaceEvent(1, "bind", "绑定了会话「计网课设 · 第三组」", "林雨桐", 21 * 24),
+  spaceEvent(1, "rename", "将空间重命名为「计网课设小组」", "林雨桐", 12 * 24),
+  spaceEvent(1, "role", "任命 陈思远 为管理员", "林雨桐", 11 * 24),
+  otherEvent(2, 1, "status", "将状态由 待办 改为 进行中", "林雨桐", 5),
+  otherEvent(3, 4, "update", "优先级 无 → 中", "许嘉怡", 30),
 ];
-export const NEXT_IDS = { event: eventId };

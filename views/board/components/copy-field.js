@@ -1,4 +1,4 @@
-// Read-only value joined to a copy button (invite code, share link). Clipboard failures fall back to
+// Read-only value joined to a copy button (invite code). Clipboard failures fall back to
 // selecting the text so it can be copied by hand.
 import { ref } from "../vue.js";
 import { notify } from "../store.js";

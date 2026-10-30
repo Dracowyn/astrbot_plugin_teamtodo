@@ -1,40 +1,81 @@
-/* Design tokens. Typeset ledger: one neutral palette, hairline rules, and ONE accent (crimson) used for
-   selection, focus, overdue and the primary action. No fills behind content, no shadows at rest.
-   Type scale: 24 title / 15 task title / 14 body / 13 meta / 12 label. */
+/* Design tokens: a Notion-like system. Warm neutral surfaces, hairline dividers, one blue accent, and a muted
+   select/tag palette (soft background + dark text). Text roles: --text, --muted (secondary), --faint (icons,
+   placeholders). Secondary text is .7 alpha (not .65) so it stays above 4.5:1 on white. */
 
 :root {
-  --ground: #fcfcfb;
-  --surface: #ffffff;     /* drawer, dialog */
-  --hover: #f3f3f1;
-  --rule: #e6e6e3;        /* hairlines */
-  --control: #c9c9c5;     /* control borders */
-  --text: #18191b;
-  --muted: #5f6166;
-  --faint: #6e7075;       /* placeholders, 4.6:1 on --ground */
-  --accent: #b42340;
+  --ground: #ffffff;
+  --surface: #ffffff;       /* side peek, dialog */
+  --sidebar: #f7f6f3;
+  --hover: rgba(55, 53, 47, 0.06);
+  --active: rgba(55, 53, 47, 0.1);
+  --rule: rgba(55, 53, 47, 0.09);
+  --control: rgba(55, 53, 47, 0.2);
+  --text: rgb(55, 53, 47);
+  --muted: rgba(55, 53, 47, 0.7);
+  --faint: rgba(55, 53, 47, 0.5);
+  --accent: #2383e2;         /* focus ring, selection, underline */
+  --accent-strong: #1a6fc9;  /* primary button: 5:1 with white */
+  --accent-soft: rgba(35, 131, 226, 0.1);
   --on-accent: #ffffff;
-  --scrim: rgba(24, 25, 27, 0.35);
-  --float-shadow: 0 6px 24px rgba(24, 25, 27, 0.14);
+  --link: #0b6bcb;
+  --danger: #c9372c;
+  --card: #ffffff;
+  --card-hover: #f7f7f5;
+  --card-shadow: rgba(15, 15, 15, 0.1) 0 0 0 1px, rgba(15, 15, 15, 0.1) 0 2px 4px;
+  --float-shadow: rgba(15, 15, 15, 0.05) 0 0 0 1px, rgba(15, 15, 15, 0.1) 0 3px 6px, rgba(15, 15, 15, 0.2) 0 9px 24px;
+  --scrim: rgba(15, 15, 15, 0.35);
+  --cover: #efe9df;
 
-  --radius: 3px;
-  --control-h: 32px;
-  --font: "Inter", system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --radius: 4px;
+  --radius-sm: 3px;
+  --control-h: 30px;
+  --font: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+
+  /* select / tag palette: --pb background, --pf text */
+  --gray-bg: #e3e2e0;   --gray-fg: #32302c;
+  --brown-bg: #eee0da;  --brown-fg: #442a1e;
+  --orange-bg: #fadec9; --orange-fg: #5c3b23;
+  --yellow-bg: #fdecc8; --yellow-fg: #402c1b;
+  --green-bg: #dbeddb;  --green-fg: #1c3829;
+  --blue-bg: #d3e5ef;   --blue-fg: #183347;
+  --purple-bg: #e8deee; --purple-fg: #412454;
+  --pink-bg: #f5e0e9;   --pink-fg: #4c2337;
+  --red-bg: #ffe2dd;    --red-fg: #5d1715;
   color-scheme: light;
 }
 
 :root[data-theme="dark"] {
-  --ground: #121315;
-  --surface: #191a1d;
-  --hover: #1d1e21;
-  --rule: #2b2d31;
-  --control: #494b51;
-  --text: #ebebe8;
-  --muted: #a6a8ad;
-  --faint: #8d8f95;
-  --accent: #ff8fa3;
-  --on-accent: #2a0b12;
-  --scrim: rgba(0, 0, 0, 0.55);
-  --float-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+  --ground: #191919;
+  --surface: #252525;
+  --sidebar: #202020;
+  --hover: rgba(255, 255, 255, 0.055);
+  --active: rgba(255, 255, 255, 0.1);
+  --rule: rgba(255, 255, 255, 0.094);
+  --control: rgba(255, 255, 255, 0.2);
+  --text: rgba(255, 255, 255, 0.81);
+  --muted: rgba(255, 255, 255, 0.6);
+  --faint: rgba(255, 255, 255, 0.46);
+  --accent: #2383e2;
+  --accent-strong: #1f78d1;
+  --accent-soft: rgba(35, 131, 226, 0.18);
+  --link: #5ba7f0;
+  --danger: #ff7369;
+  --card: #252525;
+  --card-hover: #2f2f2f;
+  --card-shadow: rgba(255, 255, 255, 0.094) 0 0 0 1px, rgba(0, 0, 0, 0.3) 0 2px 4px;
+  --float-shadow: rgba(255, 255, 255, 0.094) 0 0 0 1px, rgba(0, 0, 0, 0.3) 0 3px 6px, rgba(0, 0, 0, 0.5) 0 9px 24px;
+  --scrim: rgba(0, 0, 0, 0.6);
+  --cover: #2c2924;
+
+  --gray-bg: #4f4f4f;   --gray-fg: #f0efed;
+  --brown-bg: #5a3828;  --brown-fg: #f0efed;
+  --orange-bg: #7a4519; --orange-fg: #f0efed;
+  --yellow-bg: #7a5a22; --yellow-fg: #f0efed;
+  --green-bg: #285038;  --green-fg: #f0efed;
+  --blue-bg: #264269;   --blue-fg: #f0efed;
+  --purple-bg: #452c5c; --purple-fg: #f0efed;
+  --pink-bg: #62304a;   --pink-fg: #f0efed;
+  --red-bg: #693229;    --red-fg: #f0efed;
   color-scheme: dark;
 }

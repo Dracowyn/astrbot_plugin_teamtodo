@@ -1,71 +1,93 @@
 *, *::before, *::after { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
-body {
-  margin: 0;
-  background: var(--ground);
-  color: var(--text);
-  font: 14px/1.6 var(--font);
-  -webkit-font-smoothing: antialiased;
-}
+body { margin: 0; background: var(--ground); color: var(--text); font: 14px/1.5 var(--font); -webkit-font-smoothing: antialiased; }
 h1, h2, h3, p, ul, ol, dl, dd, figure { margin: 0; padding: 0; }
 ul, ol { list-style: none; }
 button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
-a { color: var(--text); text-decoration-color: var(--control); text-underline-offset: 3px; }
-a:hover { text-decoration-color: var(--accent); }
+a { color: var(--link); text-decoration-color: color-mix(in srgb, var(--link) 40%, transparent); text-underline-offset: 2px; }
+a:hover { text-decoration-color: var(--link); }
 .num { font-variant-numeric: tabular-nums; }
 .mono { font-family: var(--mono); font-size: 12.5px; }
 .muted { color: var(--muted); }
-.visually-hidden {
-  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden;
-  clip: rect(0 0 0 0); white-space: nowrap; border: 0;
-}
+.visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+::selection { background: var(--accent-soft); }
 
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.icon { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 
-/* Buttons: outline by default, text for quiet actions, filled only for the one primary action. */
+/* ---- buttons ---- */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-  min-height: var(--control-h); padding: 0 12px;
-  border: 1px solid var(--control); border-radius: var(--radius);
-  background: transparent; color: var(--text); white-space: nowrap; text-decoration: none;
-  transition: background-color .12s, border-color .12s;
+  min-height: var(--control-h); padding: 0 10px; border: 1px solid var(--control); border-radius: var(--radius);
+  background: transparent; color: var(--text); white-space: nowrap; text-decoration: none; line-height: 1;
+  transition: background-color .12s, border-color .12s, color .12s;
 }
-.btn:hover { background: var(--hover); border-color: var(--muted); }
-.btn[disabled] { opacity: .5; cursor: not-allowed; }
-.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-.btn-primary:hover { background: var(--accent); border-color: var(--accent); filter: brightness(1.1); }
-.btn-text { border-color: transparent; padding: 0 8px; color: var(--muted); }
-.btn-text:hover { background: transparent; border-color: transparent; color: var(--text); text-decoration: underline; }
-.btn-danger { color: var(--accent); border-color: var(--accent); }
-.btn-danger:hover { background: var(--hover); border-color: var(--accent); }
-.btn-danger.is-solid { background: var(--accent); color: var(--on-accent); }
+.btn:hover { background: var(--hover); }
+.btn[disabled] { opacity: .45; cursor: not-allowed; }
+.btn[disabled]:hover { background: transparent; }
+.btn-primary { background: var(--accent-strong); border-color: var(--accent-strong); color: var(--on-accent); }
+.btn-primary:hover { background: var(--accent-strong); filter: brightness(1.08); }
+.btn-primary[disabled]:hover { background: var(--accent-strong); filter: none; }
+.btn-text { border-color: transparent; color: var(--muted); }
+.btn-text:hover { color: var(--text); }
+.btn-danger { border-color: transparent; color: var(--danger); }
+.btn-danger:hover { background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.btn-danger.is-solid { background: var(--danger); border-color: var(--danger); color: #fff; }
+.btn-danger.is-solid:hover { filter: brightness(1.08); }
 .btn-icon { width: var(--control-h); padding: 0; }
-.btn-sm { min-height: 28px; padding: 0 10px; font-size: 13px; }
+.btn-sm { min-height: 26px; padding: 0 8px; font-size: 13px; }
 
+/* ---- form controls ---- */
 .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.field > label, .label { font-weight: 600; font-size: 13px; }
+.field > label, .label { font-weight: 500; font-size: 13px; color: var(--muted); }
 .input, .select, .textarea {
-  width: 100%; min-height: var(--control-h); padding: 4px 10px;
-  border: 1px solid var(--control); border-radius: var(--radius);
-  background: transparent; color: var(--text);
+  width: 100%; min-height: var(--control-h); padding: 3px 8px; border: 1px solid var(--control); border-radius: var(--radius);
+  background: transparent; color: var(--text); transition: background-color .12s, border-color .12s;
 }
 .select { background: var(--ground); }
 .textarea { min-height: 120px; resize: vertical; line-height: 1.6; padding: 8px 10px; }
 .input::placeholder, .textarea::placeholder { color: var(--faint); }
-.input:focus-visible, .select:focus-visible, .textarea:focus-visible { outline-offset: 0; border-color: var(--accent); }
-.hint { font-size: 13px; color: var(--muted); }
-.error-text { font-size: 13px; color: var(--accent); }
+.input:focus-visible, .select:focus-visible, .textarea:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.hint { font-size: 12.5px; color: var(--muted); }
+.error-text { font-size: 12.5px; color: var(--danger); }
+.check { display: inline-flex; align-items: center; gap: 6px; min-height: 26px; cursor: pointer; color: var(--text); }
+.check input { width: 14px; height: 14px; margin: 0; accent-color: var(--accent-strong); }
 
-/* Joined read-only value and action (invite code, share link). */
 .joined { display: flex; min-width: 0; }
 .joined .input { border-top-right-radius: 0; border-bottom-right-radius: 0; font-family: var(--mono); font-size: 13px; }
 .joined .btn { border-top-left-radius: 0; border-bottom-left-radius: 0; margin-left: -1px; }
 
-/* Flags are plain words: state is text, not a badge. */
-.flag { color: var(--muted); white-space: nowrap; }
+/* ---- pills (select / tag) and avatars: colour comes from a .c-<name> class ---- */
+.c-gray { --pb: var(--gray-bg); --pf: var(--gray-fg); }
+.c-brown { --pb: var(--brown-bg); --pf: var(--brown-fg); }
+.c-orange { --pb: var(--orange-bg); --pf: var(--orange-fg); }
+.c-yellow { --pb: var(--yellow-bg); --pf: var(--yellow-fg); }
+.c-green { --pb: var(--green-bg); --pf: var(--green-fg); }
+.c-blue { --pb: var(--blue-bg); --pf: var(--blue-fg); }
+.c-purple { --pb: var(--purple-bg); --pf: var(--purple-fg); }
+.c-pink { --pb: var(--pink-bg); --pf: var(--pink-fg); }
+.c-red { --pb: var(--red-bg); --pf: var(--red-fg); }
+.c-none { --pb: transparent; --pf: var(--muted); }
 
-.icon { width: 14px; height: 14px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.pill {
+  display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 6px; max-width: 100%;
+  border-radius: var(--radius-sm); background: var(--pb); color: var(--pf); font-size: 12.5px; line-height: 20px; white-space: nowrap;
+}
+.pill-dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: currentColor; opacity: .7; }
+.pill-label { overflow: hidden; text-overflow: ellipsis; }
+.avatar {
+  display: inline-grid; place-items: center; width: 18px; height: 18px; flex: none; border-radius: 50%;
+  background: var(--pb); color: var(--pf); font-size: 10.5px; font-weight: 600; line-height: 1; user-select: none;
+}
+/* Soft tile that carries the page icon (first character of the space name). */
+.page-icon { display: inline-grid; place-items: center; width: 56px; height: 56px; border-radius: 6px; background: var(--pb); color: var(--pf); font-size: 30px; font-weight: 600; line-height: 1; }
+
+/* A pill that is really a native <select> laid over it: looks like a Notion select, behaves like a form control. */
+.pill-select { position: relative; display: inline-flex; border-radius: var(--radius-sm); }
+.pill-select:hover .pill { filter: brightness(.97); }
+.pill-select:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+.pill-select-input { position: absolute; inset: 0; width: 100%; opacity: 0; cursor: pointer; font-size: 14px; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; scroll-behavior: auto !important; }

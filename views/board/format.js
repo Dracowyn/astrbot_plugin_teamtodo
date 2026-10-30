@@ -9,17 +9,42 @@ export const STATUSES = [
 export const STATUS_LABEL = { todo: "待办", doing: "进行中", done: "已完成", archived: "已归档" };
 export const PRIORITY_LABEL = { high: "高", medium: "中", low: "低" };
 export const PRIORITY_RANK = { high: 0, medium: 1, low: 2 };
+export const STATUS_COLOR = { todo: "gray", doing: "blue", done: "green", archived: "brown" };
+export const PRIORITY_COLOR = { high: "red", medium: "yellow", low: "gray" };
+export const ROLE_COLOR = { owner: "orange", admin: "blue", member: "gray" };
+// Red is reserved for priority 高 and overdue, so tags and avatars never use it.
+const NAME_COLORS = ["blue", "green", "purple", "orange", "pink", "brown", "yellow", "gray"];
+
+function hashString(text) {
+  let hash = 0;
+  for (const char of String(text)) hash = (hash * 31 + char.codePointAt(0)) >>> 0;
+  return hash;
+}
+/** Deterministic palette colour for a tag, avatar or space name. */
+export const tagColor = (name) => NAME_COLORS[hashString(name) % NAME_COLORS.length];
+export const avatarColor = tagColor;
+/** First visible character, upper-cased (used by avatars and page icons). */
+export const initial = (name) => [...String(name ?? "").trim()][0]?.toUpperCase() ?? "?";
 export const ROLE_LABEL = { owner: "所有者", admin: "管理员", member: "成员" };
 
-// Limits mirror core/models.py (MAX_*), enforced by the backend for every entry point.
+// Input limits. These defaults are replaced by `meta.limits` from the server (applyLimits) before the admin
+// page renders; the server enforces them for every entry point.
 export const LIMITS = { title: 200, description: 4000, tag: 20, tags: 10, assignees: 20, spaceName: 30 };
+
+/** Applies `meta.limits` ({title, description, tag, tags, assignees, space_name}); unknown keys are ignored. */
+export function applyLimits(limits = {}) {
+  const { space_name: spaceName, ...rest } = limits;
+  for (const [key, value] of Object.entries({ ...rest, spaceName })) {
+    if (key in LIMITS && Number.isInteger(value) && value > 0) LIMITS[key] = value;
+  }
+}
 
 export const nowSeconds = () => Date.now() / 1000;
 
 /** Identity key: "platform_id:user_id" (UserRef.key); falls back to the nickname on the public board. */
 export const userKey = (user) => (user.platform_id ? `${user.platform_id}:${user.user_id}` : user.nickname);
 
-/** Overdue = due date passed and the task is still todo/doing. */
+/** Client-side overdue, used only by the public board (the admin API sends a server-computed `overdue`). */
 export function isOverdue(task, now = nowSeconds()) {
   return task.due_at != null && task.due_at < now && (task.status === "todo" || task.status === "doing");
 }
@@ -69,6 +94,19 @@ export function formatDue(seconds, now = nowSeconds()) {
   const date = `${pad(p.month)}-${pad(p.day)}`;
   return p.year === today.year ? `${date} ${time}` : `${p.year}-${date} ${time}`;
 }
+
+/** Day heading for grouped logs: 今天 / 昨天 / 10月28日 / 2025年12月3日. */
+export function formatDayHeading(seconds, now = nowSeconds()) {
+  const p = wallParts(seconds);
+  const today = wallParts(now);
+  const diff = dayIndex(today) - dayIndex(p);
+  if (diff === 0) return "今天";
+  if (diff === 1) return "昨天";
+  return p.year === today.year ? `${p.month}月${p.day}日` : `${p.year}年${p.month}月${p.day}日`;
+}
+
+/** "HH:mm" in the configured zone. */
+export const formatClock = (seconds) => formatDateTime(seconds).slice(11);
 
 /** Relative time for logs and "updated" stamps. */
 export function formatRelative(seconds, now = nowSeconds()) {

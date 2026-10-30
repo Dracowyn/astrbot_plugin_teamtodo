@@ -21,7 +21,7 @@ export default {
         <circle :key="cycle" class="refresh-arc" cx="8" cy="8" :r="RADIUS" transform="rotate(-90 8 8)"
                 :style="{ strokeDasharray: CIRCUMFERENCE, animationDuration: seconds + 's' }" />
       </svg>
-      <span>{{ failed ? '刷新失败，稍后重试' : refreshing ? '刷新中…' : '每 ' + seconds + ' 秒自动刷新' }}</span>
+      <span>{{ failed ? '刷新失败，稍后重试' : refreshing ? '刷新中…' : '每 ' + seconds + ' 秒刷新' }}</span>
     </span>
   `,
 };

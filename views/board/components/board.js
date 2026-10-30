@@ -15,7 +15,7 @@ export default {
     editable: { type: Boolean, default: false },
     showArchived: { type: Boolean, default: false },
   },
-  emits: ["open", "move"],
+  emits: ["open", "move", "add"],
   setup(props, { emit }) {
     const columns = computed(() => {
       const list = props.showArchived ? [...STATUSES, ARCHIVED_COLUMN] : STATUSES;
@@ -36,8 +36,8 @@ export default {
   template: `
     <div class="board" :style="{ '--cols': columns.length }" role="group" aria-label="任务看板">
       <BoardColumn v-for="column in columns" :key="column.key" :status="column.key" :label="column.label"
-                   :tasks="column.tasks" :now="now" :editable="editable"
-                   @open="$emit('open', $event)" @move="onMove" />
+                   :tasks="column.tasks" :now="now" :editable="editable" :addable="editable && column.key !== 'archived'"
+                   @open="$emit('open', $event)" @move="onMove" @add="$emit('add', $event)" />
     </div>
   `,
 };
