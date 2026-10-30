@@ -1,6 +1,7 @@
 // Task properties as Notion-style rows (line icon + gray label + value). Shared by the create panel (compact)
 // and the side peek (full: big title, status, extra read-only rows via the default slot, then the description).
 // Edits a draft object in place (the parent owns it); see draft.js for its shape.
+import { computed, nextTick, ref } from "../vue.js";
 import { LIMITS, PRIORITY_COLOR, PRIORITY_LABEL, STATUS_COLOR, STATUSES, STATUS_LABEL } from "../format.js";
 import Icon from "./icon.js";
 import MemberPicker from "./member-picker.js";
@@ -25,8 +26,25 @@ export default {
     tagSuggestions: { type: Array, default: () => [] },
     full: { type: Boolean, default: false }, // adds title, status and description
   },
-  setup() {
-    return { id: `tf${++uid}`, LIMITS, STATUS_OPTIONS, PRIORITY_OPTIONS };
+  setup(props) {
+    const editing = ref(false);
+    const descInput = ref(null);
+    const descLength = computed(() => [...props.draft.description].length);
+
+    // Auto-growing textarea: collapse to measure scrollHeight, then fit the content.
+    function grow() {
+      const el = descInput.value;
+      if (!el) return;
+      el.style.height = "auto";
+      el.style.height = `${el.scrollHeight}px`;
+    }
+    async function editDesc() {
+      editing.value = true;
+      await nextTick();
+      descInput.value?.focus();
+      grow();
+    }
+    return { id: `tf${++uid}`, LIMITS, STATUS_OPTIONS, PRIORITY_OPTIONS, editing, descInput, descLength, grow, editDesc };
   },
   template: `
     <div class="fields">
@@ -65,14 +83,14 @@ export default {
       <template v-if="full">
         <hr class="divider">
         <div class="desc">
-          <label class="visually-hidden" :for="id + '-desc'">描述</label>
-          <textarea :id="id + '-desc'" v-model="draft.description" class="textarea textarea-flat" :maxlength="LIMITS.description"
-                    placeholder="添加描述…（纯文本，链接会自动识别）"></textarea>
-          <p class="hint num">{{ [...draft.description].length }} / {{ LIMITS.description }}</p>
-          <details v-if="draft.description" class="preview">
-            <summary>预览显示效果</summary>
-            <RichText :text="draft.description" />
-          </details>
+          <textarea v-if="editing" :id="id + '-desc'" ref="descInput" v-model="draft.description" class="desc-input" :maxlength="LIMITS.description"
+                    rows="1" aria-label="描述" @input="grow" @blur="editing = false"></textarea>
+          <div v-else class="desc-view" tabindex="0" :role="draft.description ? undefined : 'button'"
+               :aria-label="draft.description ? '描述，点击编辑' : '添加描述'" @click="editDesc" @keydown.enter.self.prevent="editDesc" @keydown.space.self.prevent="editDesc">
+            <RichText v-if="draft.description" :text="draft.description" />
+            <span v-else class="desc-empty">添加描述…</span>
+          </div>
+          <p v-if="editing && descLength > LIMITS.description * 0.8" class="hint num desc-count">{{ descLength }} / {{ LIMITS.description }}</p>
         </div>
       </template>
     </div>

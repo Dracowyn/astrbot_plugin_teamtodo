@@ -3,7 +3,8 @@ import { h } from "../vue.js";
 
 const PATHS = {
   close: "M4 4l8 8M12 4l-8 8",
-  plus: "M8 3v10M3 8h10",
+  check: "M3.5 8.5l3 3 6-6.5",
+  plus:"M8 3v10M3 8h10",
   menu: "M2.5 4.5h11M2.5 8h11M2.5 11.5h11",
   status: "M8 2.5a5.5 5.5 0 1 0 0 11a5.5 5.5 0 0 0 0-11zM8 6a2 2 0 1 0 0 4a2 2 0 0 0 0-4z",
   calendar: "M3.5 4h9a1 1 0 0 1 1 1v7.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zM2.5 7.5h11M5.5 2.5v3M10.5 2.5v3",
