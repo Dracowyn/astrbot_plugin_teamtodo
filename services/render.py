@@ -4,7 +4,7 @@ CONTRACT (signatures and behaviour fixed by the main loop):
 
 - Status labels: 待办 / 进行中 / 已完成 / 已归档. Priority: 高 / 中 / 低.
 - ``nicknames`` maps ``UserRef.key`` -> display name; fall back to
-  ``user_id`` when missing. Assignees render as ``@name``.
+  ``user_id`` when missing or empty. Assignees render as ``@name``.
 - A task is overdue when ``due_at < now`` and its status is TODO or DOING.
 - Due dates render in ``tz`` as ``MM-DD HH:MM`` (``YYYY-MM-DD HH:MM`` when
   not in the current year); overdue appends ``（已逾期）``.
@@ -17,14 +17,31 @@ CONTRACT (signatures and behaviour fixed by the main loop):
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import tzinfo
+from datetime import datetime, tzinfo
 
-from ..core.models import Space, Task
+from ..core.models import Priority, Space, Task, TaskStatus
+
+_STATUS_LABELS = {
+    TaskStatus.TODO: "待办",
+    TaskStatus.DOING: "进行中",
+    TaskStatus.DONE: "已完成",
+    TaskStatus.ARCHIVED: "已归档",
+}
+_PRIORITY_LABELS = {
+    Priority.HIGH: "高",
+    Priority.MEDIUM: "中",
+    Priority.LOW: "低",
+}
 
 
 def format_due(due_at: float | None, now: float, tz: tzinfo) -> str:
     """Render a due time, or ``""`` when ``due_at`` is ``None``."""
-    raise NotImplementedError
+    if due_at is None:
+        return ""
+    due = datetime.fromtimestamp(due_at, tz)
+    current = datetime.fromtimestamp(now, tz)
+    pattern = "%m-%d %H:%M" if due.year == current.year else "%Y-%m-%d %H:%M"
+    return due.strftime(pattern)
 
 
 def task_line(
@@ -39,7 +56,20 @@ def task_line(
 
     When ``space_name`` is given the ref is written ``空间名#3``.
     """
-    raise NotImplementedError
+    reference = f"{space_name if space_name is not None else ''}#{task.seq}"
+    parts = [reference, f"[{_STATUS_LABELS[task.status]}]", task.title]
+    parts.extend(
+        f"@{nicknames.get(user.key) or user.user_id}" for user in task.assignees
+    )
+    if task.due_at is not None:
+        due = format_due(task.due_at, now, tz)
+        if task.due_at < now and task.status in (TaskStatus.TODO, TaskStatus.DOING):
+            due += "（已逾期）"
+        parts.append(f"截止 {due}")
+    if task.priority is not None:
+        parts.append(f"!{_PRIORITY_LABELS[task.priority]}")
+    parts.extend(f"[{tag}]" for tag in task.tags)
+    return " ".join(parts)
 
 
 def task_detail(
@@ -50,7 +80,16 @@ def task_detail(
     tz: tzinfo,
 ) -> str:
     """Multi-line detail including creator, created time and description."""
-    raise NotImplementedError
+    created = datetime.fromtimestamp(task.created_at, tz).strftime("%Y-%m-%d %H:%M")
+    creator = nicknames.get(task.creator.key) or task.creator.user_id
+    lines = [
+        task_line(task, nicknames, now, tz, space_name=space_name),
+        f"创建人：{creator}",
+        f"创建时间：{created}",
+    ]
+    if task.description:
+        lines.extend(("描述：", task.description))
+    return "\n".join(lines)
 
 
 def task_list(
@@ -65,7 +104,24 @@ def task_list(
     """Header with the space name, then tasks grouped by status in the order
     待办, 进行中, 已完成, 已归档 (empty groups omitted), each group ordered by
     ``seq``. ``暂无任务`` when ``tasks`` is empty."""
-    raise NotImplementedError
+    if not tasks:
+        return f"{space_name}\n暂无任务"
+    lines = [space_name]
+    remaining = max(0, limit)
+    shown = 0
+    for status, label in _STATUS_LABELS.items():
+        group = sorted(
+            (task for task in tasks if task.status == status), key=lambda task: task.seq
+        )
+        visible = group[:remaining]
+        if visible:
+            lines.append(label)
+            lines.extend(task_line(task, nicknames, now, tz) for task in visible)
+            shown += len(visible)
+            remaining -= len(visible)
+    if shown < len(tasks):
+        lines.append(f"…还有 {len(tasks) - shown} 条")
+    return "\n".join(lines)
 
 
 def mine_list(
@@ -78,15 +134,63 @@ def mine_list(
 ) -> str:
     """``(space_name, task)`` pairs in the given order, each rendered with
     ``task_line(..., space_name=...)``. ``没有指派给你的任务`` when empty."""
-    raise NotImplementedError
+    if not items:
+        return "没有指派给你的任务"
+    visible = items[: max(0, limit)]
+    lines = [
+        task_line(task, nicknames, now, tz, space_name=space_name)
+        for space_name, task in visible
+    ]
+    if len(visible) < len(items):
+        lines.append(f"…还有 {len(items) - len(visible)} 条")
+    return "\n".join(lines)
 
 
 def spaces_list(rows: list[tuple[Space, bool, bool]]) -> str:
     """``(space, is_session_default, is_current_for_user)`` rows, one per
     line, marking ``（默认）`` and ``（当前）``."""
-    raise NotImplementedError
+    return "\n".join(
+        space.name
+        + ("（默认）" if is_default else "")
+        + ("（当前）" if is_current else "")
+        for space, is_default, is_current in rows
+    )
 
 
 def help_text() -> str:
     """Command summary shown by ``/todo`` and ``/todo help``."""
-    raise NotImplementedError
+    return "\n".join(
+        (
+            "任务命令（以 /todo 开头）：",
+            "/todo 或 /todo help：显示帮助",
+            "/todo add <字段…>：在当前空间创建任务",
+            "/todo list [空间名] [all]：列出任务，all 包含已归档",
+            "/todo mine：查看指派给自己的任务（群聊只含本群空间）",
+            "/todo show <ref>：查看详情",
+            "/todo start <ref>：改为进行中",
+            "/todo done <ref>：改为已完成",
+            "/todo reopen <ref>：改为待办",
+            "/todo archive <ref>：改为已归档",
+            "/todo assign <ref> [@a @b]：整体替换负责人，留空清除",
+            "/todo assign <ref> +@a -@b：增减负责人",
+            "/todo edit <ref> <字段…>：修改标题、截止时间、优先级、标签",
+            "/todo desc <ref> [全文]：设置描述，留空清除",
+            "/todo delete <ref>：删除任务",
+            "ref 写作 #3、3 或 空间名#3；只能引用本会话绑定的空间。",
+            "字段：标题、@负责人、日期 [HH:MM]、!高 / !中 / !低、[标签]。",
+            "edit 可用 无截止、!无、[-标签] 清除或移除字段。双引号内按字面理解。",
+            "日期：YYYY-MM-DD、MM-DD、今天、明天、后天、周一到周日（下一个）；默认 23:59。",
+            "空间与会话命令：",
+            "/todo spaces：列出本会话绑定的空间，标记默认和当前空间",
+            "/todo use <空间名>：切换自己的当前空间",
+            "/todo default <空间名>：修改会话默认空间",
+            "/todo space new <名字>：新建、绑定空间并切换为自己的当前空间",
+            "/todo space rename <新名字>：重命名当前空间",
+            "/todo space delete <空间名> [确认码]：删除空间，需在 60 秒内二次确认",
+            "/todo invite：重置当前空间邀请码，旧码失效",
+            "/todo join <邀请码>：将本会话绑定到对应空间",
+            "/todo leave <空间名>：解绑本会话与空间",
+            "/todo claim：认领当前无主空间",
+            "/todo admin +@x / -@x：任命或撤销当前空间管理员",
+        )
+    )

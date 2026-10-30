@@ -5,15 +5,19 @@ CONTRACT (signatures and behaviour fixed by the main loop):
 ``main.py`` converts the incoming message chain into ``parts``: a list where
 plain text becomes ``str`` and each ``At`` component becomes a ``Mention``
 (``At(qq="all")`` and the bot itself are dropped). Order is preserved, so
-``+`` / ``-`` written right before a mention can be detected.
+``+`` / ``-`` (also ``＋`` / ``－``) right before a mention can be detected.
 
 Syntax is documented in ``docs/design.md`` section 4. Tokens are separated
 by whitespace. Field tokens may appear anywhere after the task reference:
 
 - date: see ``core/dates.py`` (``无截止`` clears the due date in ``edit``)
 - priority: ``!高`` ``!中`` ``!低`` (``!无`` clears it in ``edit``); also
-  ASCII ``!high`` ``!medium`` ``!low`` ``!none``, case-insensitive
-- tag: ``[标签]`` adds, ``[-标签]`` removes (removal only meaningful in edit)
+  ASCII ``!high`` ``!medium`` ``!low`` ``!none``, case-insensitive. The
+  full-width prefix ``！`` is equivalent to ``!`` for all priority forms.
+- tag: ``[标签]`` adds, ``[-标签]`` removes (removal only meaningful in edit).
+  Brackets ``【】`` and ``［］`` are equivalent to ``[]``; opening and closing
+  forms may be mixed, e.g. ``[标签】`` or ``【-标签］``.
+- assignment: ``+@a -@b`` accepts equivalent signs ``＋@a －@b``.
 - everything else, joined by single spaces, is the title
 - a title wrapped in straight or curly double quotes is taken literally
   (its words are not interpreted as fields)
@@ -26,9 +30,11 @@ Chinese message.
 from __future__ import annotations
 
 import dataclasses as dcs
+import re
 from datetime import datetime
 
-from .models import Mention, Priority
+from .dates import parse_due_tokens
+from .models import Mention, Priority, TodoError
 
 Part = str | Mention
 
@@ -84,12 +90,23 @@ def strip_command(parts: list[Part], path: tuple[str, ...]) -> list[Part]:
         command words are not found at the start, ``parts`` is returned
         unchanged.
     """
-    raise NotImplementedError
+    if not path:
+        return parts
+    text = _leading_text(parts)
+    offset = 0
+    while offset < len(text) and not text[offset].isalnum():
+        offset += 1
+    for word in path:
+        match = re.match(r"\s*(\S+)", text[offset:])
+        if match is None or match[1].casefold() != word.casefold():
+            return parts
+        offset += match.end()
+    return _cut_prefix(parts, offset)
 
 
 def text_of(parts: list[Part]) -> str:
     """Concatenate the text parts (mentions dropped), stripped."""
-    raise NotImplementedError
+    return "".join(part for part in parts if isinstance(part, str)).strip()
 
 
 def parse_task_ref(token: str) -> TaskRef | None:
@@ -97,7 +114,17 @@ def parse_task_ref(token: str) -> TaskRef | None:
 
     ``seq`` must be a positive integer.
     """
-    raise NotImplementedError
+    match = re.fullmatch(r"(?:(?P<space>[^#＃\s]+)?[#＃])?(?P<seq>[0-9]+)", token)
+    if match is None:
+        return None
+    digits = match["seq"].lstrip("0")
+    if not digits:
+        return None
+    try:
+        seq = int(digits)
+    except ValueError:
+        return None
+    return TaskRef(space_name=match["space"], seq=seq)
 
 
 def split_ref(parts: list[Part]) -> tuple[TaskRef, list[Part]]:
@@ -106,7 +133,11 @@ def split_ref(parts: list[Part]) -> tuple[TaskRef, list[Part]]:
     Raises:
         TodoError: Missing or malformed reference.
     """
-    raise NotImplementedError
+    match = re.match(r"\s*(\S+)", _leading_text(parts))
+    ref = parse_task_ref(match[1]) if match else None
+    if ref is None:
+        raise TodoError("请提供有效的任务编号，如 #3")
+    return ref, _cut_prefix(parts, match.end())
 
 
 def parse_task_fields(parts: list[Part], now: datetime) -> TaskFields:
@@ -120,7 +151,70 @@ def parse_task_fields(parts: list[Part], now: datetime) -> TaskFields:
         TodoError: Empty tag ``[]``, conflicting tokens (two dates, two
             priorities), or an unterminated quoted title.
     """
-    raise NotImplementedError
+    tokens = _field_tokens(parts)
+    title: list[str] = []
+    mentions: list[Mention] = []
+    due_at = None
+    clear_due = False
+    priority = None
+    clear_priority = False
+    add_tags: list[str] = []
+    remove_tags: list[str] = []
+    has_due = has_priority = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if isinstance(token, Mention):
+            mentions.append(token)
+            continue
+        word, quoted = token
+        if quoted:
+            title.append(" ".join(word.split()))
+            continue
+        if word == "无截止":
+            if has_due:
+                raise TodoError("截止日期不能重复")
+            has_due = clear_due = True
+            continue
+        date_tokens = [word]
+        if index < len(tokens):
+            following = tokens[index]
+            if not isinstance(following, Mention) and not following[1]:
+                date_tokens.append(following[0])
+        parsed_due, consumed = parse_due_tokens(date_tokens, now)
+        if consumed:
+            if has_due:
+                raise TodoError("截止日期不能重复")
+            due_at = parsed_due
+            has_due = True
+            index += consumed - 1
+            continue
+        priority_token = ("!" + word[1:] if word.startswith("！") else word).casefold()
+        if priority_token in _PRIORITIES:
+            if has_priority:
+                raise TodoError("优先级不能重复")
+            priority = _PRIORITIES[priority_token]
+            clear_priority = priority is None
+            has_priority = True
+            continue
+        tag = re.fullmatch(r"[\[【［](-?)([^\[\]【】［］]*)[\]】］]", word)
+        if tag:
+            if not tag[2]:
+                raise TodoError("标签不能为空")
+            (remove_tags if tag[1] else add_tags).append(tag[2])
+            continue
+        title.append(word)
+    return TaskFields(
+        title=" ".join(part for part in title if part),
+        mentions=_unique_mentions(mentions),
+        due_at=due_at,
+        clear_due=clear_due,
+        priority=priority,
+        clear_priority=clear_priority,
+        add_tags=tuple(dict.fromkeys(add_tags)),
+        remove_tags=tuple(dict.fromkeys(remove_tags)),
+    )
 
 
 def parse_assign(parts: list[Part]) -> AssignOps:
@@ -132,4 +226,104 @@ def parse_assign(parts: list[Part]) -> AssignOps:
     Raises:
         TodoError: Any non-whitespace text other than ``+``/``-`` signs.
     """
-    raise NotImplementedError
+    signed: list[tuple[str, Mention]] = []
+    previous = ""
+    for part in parts:
+        if isinstance(part, str):
+            part = part.replace("＋", "+").replace("－", "-")
+            if any(not char.isspace() and char not in "+-" for char in part):
+                raise TodoError("负责人参数只能包含 @ 和加减号")
+            previous = part.rstrip()
+        else:
+            sign = previous[-1:] if previous else ""
+            signed.append((sign, part))
+            previous = ""
+    if not any(sign for sign, _ in signed):
+        return AssignOps(
+            replace=_unique_mentions([mention for _, mention in signed]),
+            add=(),
+            remove=(),
+        )
+    return AssignOps(
+        replace=None,
+        add=_unique_mentions([mention for sign, mention in signed if sign != "-"]),
+        remove=_unique_mentions([mention for sign, mention in signed if sign == "-"]),
+    )
+
+
+_PRIORITIES = {
+    "!高": Priority.HIGH,
+    "!high": Priority.HIGH,
+    "!中": Priority.MEDIUM,
+    "!medium": Priority.MEDIUM,
+    "!低": Priority.LOW,
+    "!low": Priority.LOW,
+    "!无": None,
+    "!none": None,
+}
+
+
+def _leading_text(parts: list[Part]) -> str:
+    chunks: list[str] = []
+    for part in parts:
+        if isinstance(part, Mention):
+            break
+        chunks.append(part)
+    return "".join(chunks)
+
+
+def _cut_prefix(parts: list[Part], count: int) -> list[Part]:
+    for index, part in enumerate(parts):
+        if isinstance(part, Mention):
+            return parts[index:]
+        if count >= len(part):
+            count -= len(part)
+            continue
+        rest = part[count:].lstrip()
+        return ([rest] if rest else []) + parts[index + 1 :]
+    return []
+
+
+def _unique_mentions(mentions: list[Mention]) -> tuple[Mention, ...]:
+    users: dict[str, Mention] = {}
+    for mention in mentions:
+        users.setdefault(mention.user.key, mention)
+    return tuple(users.values())
+
+
+def _field_tokens(parts: list[Part]) -> list[Mention | tuple[str, bool]]:
+    tokens: list[Mention | tuple[str, bool]] = []
+    chunks: list[str] = []
+    for part in parts:
+        if isinstance(part, str):
+            chunks.append(part)
+            continue
+        tokens.extend(_text_tokens("".join(chunks)))
+        chunks.clear()
+        tokens.append(part)
+    tokens.extend(_text_tokens("".join(chunks)))
+    return tokens
+
+
+def _text_tokens(text: str) -> list[tuple[str, bool]]:
+    tokens: list[tuple[str, bool]] = []
+    position = 0
+    while position < len(text):
+        char = text[position]
+        if char.isspace():
+            position += 1
+            continue
+        if char in '"“':
+            closing = '"' if char == '"' else "”"
+            end = text.find(closing, position + 1)
+            if end < 0:
+                raise TodoError("标题引号未闭合")
+            tokens.append((text[position + 1 : end], True))
+            position = end + 1
+            continue
+        end = position + 1
+        while end < len(text) and not text[end].isspace() and text[end] not in '"“':
+            end += 1
+        tokens.append((text[position:end], False))
+        position = end
+    return tokens

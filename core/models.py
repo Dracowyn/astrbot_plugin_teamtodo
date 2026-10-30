@@ -231,7 +231,8 @@ class Invite:
 
     space_id: int
     code_hash: str
-    """``hashlib.sha256(code.encode()).hexdigest()``"""
+    """SHA-256 hex of the normalized code (stripped, uppercased); see
+    ``services.access.hash_invite_code``."""
     expires_at: float
 
 

@@ -1,0 +1,8 @@
+{
+  "timezone": {
+    "description": "时区",
+    "type": "string",
+    "default": "Asia/Shanghai",
+    "hint": "IANA 时区名，用于解析和显示截止时间；无效时回退到 Asia/Shanghai"
+  }
+}
