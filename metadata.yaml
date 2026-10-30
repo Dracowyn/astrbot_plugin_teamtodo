@@ -1,0 +1,8 @@
+name: astrbot_plugin_teamtodo
+display_name: 协作 TODO
+desc: 面向单人和群聊的协作 TODO：任务卡片与看板，空间可跨群共享，支持 /todo 指令、LLM 对话管理、WebUI 管理页和只读公开看板。
+short_desc: 单人 / 群聊协作 TODO 看板
+version: v0.1.0
+author: Dracowyn
+repo: https://github.com/Dracowyn/astrbot_plugin_teamtodo
+astrbot_version: ">=4.29,<5"
