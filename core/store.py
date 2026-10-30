@@ -33,6 +33,8 @@ from .models import (
     Member,
     Priority,
     Space,
+    SpaceEvent,
+    SpaceEventDraft,
     SpaceRole,
     Task,
     TaskDraft,
@@ -136,7 +138,19 @@ def _migrate_v1(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
-_MIGRATIONS = (_migrate_v1,)
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    """M3: session display titles and the space-level log.
+
+    ``session_titles(session TEXT PRIMARY KEY, title TEXT NOT NULL,
+    updated_at REAL NOT NULL)`` -- not tied to bindings, a title survives
+    unbinding. ``space_events`` mirrors ``events`` without ``task_seq`` and
+    cascades on space deletion, with an index on
+    ``(space_id, created_at DESC, id DESC)``.
+    """
+    # Stub so existing stores still open while M3 is implemented.
+
+
+_MIGRATIONS = (_migrate_v1, _migrate_v2)
 
 
 class Store:
@@ -288,7 +302,8 @@ class Store:
 
     def delete_space(self, space_id: int) -> None:
         """Delete the space and everything under it (bindings, defaults,
-        current-space rows, members, tasks, assignees, tags, events, invite)."""
+        current-space rows, members, tasks, assignees, tags, events, space events,
+        invite). Session titles are kept."""
         self._require_transaction()
         self._conn.execute("DELETE FROM spaces WHERE id=?", (space_id,))
 
@@ -639,6 +654,26 @@ class Store:
                 (space_id, task_seq, limit),
             )
         return [self._event(row) for row in rows]
+
+    def add_space_event(self, draft: SpaceEventDraft) -> SpaceEvent:
+        """Append a space-level log entry (``detail`` stored as JSON). (M3)"""
+        raise NotImplementedError
+
+    def list_space_events(self, space_id: int, limit: int = 50) -> list[SpaceEvent]:
+        """Space-level entries of a space, newest first (``created_at DESC,
+        id DESC``). (M3)"""
+        raise NotImplementedError
+
+    # ----- session titles -----
+
+    def set_session_title(self, session: str, title: str) -> None:
+        """Insert or replace the display title of a session; ``updated_at`` is
+        the store clock. Requires a transaction. (M3)"""
+        raise NotImplementedError
+
+    def get_session_titles(self, sessions: list[str]) -> dict[str, str]:
+        """Titles of the given sessions; sessions without one are absent. (M3)"""
+        raise NotImplementedError
 
     # ----- invites -----
 

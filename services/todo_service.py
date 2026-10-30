@@ -361,6 +361,16 @@ class TodoService:
             raise TodoError(f"空间名不能超过 {MAX_SPACE_NAME_CHARS} 字")
         return name
 
+    def note_session_title(self, session: str, title: str) -> None:
+        """Remember the display title of a session for the WebUI (M3).
+
+        Called by ``main.py`` and the LLM tools on every use: the group name
+        in group chats, the sender's nickname in private chats. Blank titles
+        are ignored; writes only when the stored title differs. Never raises
+        ``TodoError``.
+        """
+        raise NotImplementedError
+
     # ----- tasks -----
 
     def add_task(

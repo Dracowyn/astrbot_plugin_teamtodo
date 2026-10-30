@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime, tzinfo
 
-from ..core.models import Priority, Space, Task, TaskStatus
+from ..core.models import Priority, Space, SpaceEvent, Task, TaskEvent, TaskStatus
 
 _STATUS_LABELS = {
     TaskStatus.TODO: "待办",
@@ -84,6 +84,35 @@ def reminder_text(task: Task, space_name: str, now: float, tz: tzinfo) -> str:
     else:
         timing = f"已于 {due} 逾期"
     return f"⏰ {space_name}#{task.seq} {task.title} {timing}"
+
+
+def event_summary(
+    event: TaskEvent | SpaceEvent, nicknames: Mapping[str, str], tz: tzinfo
+) -> str:
+    """One Chinese line describing a log entry for the WebUI (M3).
+
+    Users are shown as ``@nickname`` (``user_id`` fallback, like
+    ``task_line``); times with ``format_due``; statuses and priorities with
+    the labels above; field names as 标题 / 截止时间 / 优先级 / 标签 / 描述.
+    Must handle every ``EventAction`` and ``SpaceEventAction`` with the
+    ``detail`` shapes documented in ``core/models.py`` and written by the
+    services (incl. auto-archive ``{"auto": True}`` and DELETE snapshots),
+    and must not raise on an unexpected ``detail`` (fall back to the action
+    name). Examples: ``创建任务 #3「写周报」``, ``#3 状态：待办 → 进行中``,
+    ``#3 负责人：@张三 → @张三 @李四``, ``修改 #3：标题、截止时间``,
+    ``#3 自动归档``, ``删除任务 #3「写周报」``, ``空间改名：旧 → 新``,
+    ``@李四：成员 → 管理员``, ``重置邀请码，有效期至 11-06 18:00``.
+    Description texts are never included (they may be long).
+    """
+    raise NotImplementedError
+
+
+def event_actor_name(
+    event: TaskEvent | SpaceEvent, nicknames: Mapping[str, str]
+) -> str:
+    """Who did it: member nickname (``user_id`` fallback) for chat users,
+    ``actor_label`` for WebUI users, ``系统`` for automatic actions (M3)."""
+    raise NotImplementedError
 
 
 def task_detail(

@@ -20,6 +20,9 @@ MAX_TAGS = 10
 MAX_ASSIGNEES = 20
 MAX_SPACE_NAME_CHARS = 30
 """Limits enforced by services for every entry point (commands, LLM, WebUI)."""
+WEBUI_PLATFORM = "webui"
+"""``UserRef.platform_id`` of the creator of tasks made in the WebUI; the
+``user_id`` is the dashboard username. Never bound to a chat session (M3)."""
 
 
 class TaskStatus(StrEnum):
@@ -218,6 +221,56 @@ class TaskEvent:
     space_id: int
     task_seq: int
     action: EventAction
+    detail: dict
+    actor: UserRef | None
+    actor_label: str
+    session: str
+    created_at: float
+
+
+class SpaceEventAction(StrEnum):
+    """Kinds of space-level log entries (M3). ``detail`` per action:
+
+    - CREATE ``{"name": str}`` (``space new`` or auto-create)
+    - RENAME ``{"name": [old, new]}``
+    - BIND / UNBIND ``{"session": str}`` (``space new``, auto-create, ``join``
+      / ``leave``, WebUI unbind)
+    - CLAIM ``{}``
+    - ROLE ``{"user": UserRef.key, "role": [old, new]}``
+    - INVITE ``{"expires_at": float}`` (invite created or reset)
+
+    Deleting a space deletes its log, so there is no DELETE entry.
+    """
+
+    CREATE = "create"
+    RENAME = "rename"
+    BIND = "bind"
+    UNBIND = "unbind"
+    CLAIM = "claim"
+    ROLE = "role"
+    INVITE = "invite"
+
+
+@dcs.dataclass(frozen=True)
+class SpaceEventDraft:
+    """Input for one space-level log entry (M3); same actor rules as
+    ``TaskEventDraft``."""
+
+    space_id: int
+    action: SpaceEventAction
+    detail: dict
+    actor: UserRef | None = None
+    actor_label: str = ""
+    session: str = ""
+
+
+@dcs.dataclass(frozen=True)
+class SpaceEvent:
+    """A stored space-level log entry (M3)."""
+
+    id: int
+    space_id: int
+    action: SpaceEventAction
     detail: dict
     actor: UserRef | None
     actor_label: str

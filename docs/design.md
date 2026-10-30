@@ -248,6 +248,48 @@
   - 管理会话绑定、角色、邀请码、分享链接
   - 查看操作日志
 
+**M3 定稿**：
+
+- 决定（用户选定）：
+  - WebUI 建的任务，创建人记为 `UserRef("webui", 登录用户名)`；WebUI 的写操作在日志里记 `actor_label=用户名`，`actor` 为空。
+  - 会话显示标题单独存一张表 `session_titles`。每次有人在该会话用 `/todo` 或 LLM 工具时刷新：群聊存群名，私聊存发送者昵称。解绑后标题仍保留。
+  - 新增空间级日志表 `space_events`（迁移 2）。聊天命令和 WebUI 的空间级操作都写进去（动作和 detail 格式见 `core/models.py` 的 `SpaceEventAction`），日志页和任务日志合并显示。
+- 模块：
+  - `services/admin_service.py`：WebUI 的业务操作。调用者都是 AstrBot 管理员，不做空间级权限检查，但长度上限和状态规则与聊天入口共用同一套代码。
+  - `services/web_api.py`：路由、参数校验、序列化。路由注册为 `/astrbot_plugin_teamtodo/<path>`。
+- 分享链接（`share`）属于 M4，M3 不注册这个接口，页面隐藏分享区域。
+- 删除空间在 WebUI 里不用确认码，由页面弹窗二次确认。
+
+**HTTP 接口**（前端用 `window.AstrBotPluginView.apiGet/apiPost` 调用；时间都是 Unix 秒；出错时用 `error_response(中文文案, status_code)` 返回：参数不对 400、空间或任务不存在 404、业务冲突 409，其余由 `TodoError` 转为 400）：
+
+| 方法 | 路径 | 入参 | 返回 |
+|---|---|---|---|
+| GET | `meta` | | `{timezone, server_time, auto_archive_days, remind_before_minutes, limits:{title,description,tag,tags,assignees,space_name}}` |
+| GET | `spaces` | | `{spaces: SpaceSummary[]}` |
+| GET | `spaces/<space_id>` | | `SpaceDetail` |
+| POST | `spaces/<space_id>/rename` | `{name}` | `SpaceDetail` |
+| POST | `spaces/<space_id>/delete` | `{}` | `{ok: true}` |
+| POST | `spaces/<space_id>/unbind` | `{session}` | `SpaceDetail` |
+| POST | `spaces/<space_id>/members/role` | `{platform_id, user_id, role: "admin"\|"member"}` | `SpaceDetail` |
+| POST | `spaces/<space_id>/invite/reset` | `{}` | `{code, expires_at}`（明文码只在这次返回） |
+| GET | `spaces/<space_id>/tasks` | `include_archived=1`（可选） | `{tasks: Task[], server_time}` |
+| POST | `spaces/<space_id>/tasks` | `{title, assignees?: Ref[], due_at?, tags?, priority?, description?}` | `Task` |
+| GET | `spaces/<space_id>/tasks/<seq>` | | `{task: Task, events: Event[]}`（新的在前） |
+| POST | `spaces/<space_id>/tasks/<seq>` | 部分字段：`{title?, description?, status?, assignees?: Ref[], due_at?: number\|null, tags?, priority?: string\|null}`；`due_at`/`priority` 传 `null` 表示清除，`assignees`/`tags` 整体替换 | `Task` |
+| POST | `spaces/<space_id>/tasks/<seq>/delete` | `{}` | `{ok: true}` |
+| GET | `spaces/<space_id>/events` | `limit`（默认 50，最大 200） | `{events: Event[]}`（新的在前） |
+
+数据形状：
+
+- `Ref = {platform_id, user_id}`
+- `User = Ref & {nickname}`：昵称取空间成员表，没有时用 `user_id`；WebUI 创建人的昵称是登录用户名。
+- `Task = {space_id, seq, title, status, assignees: User[], due_at, tags, priority, description, creator: User, created_at, updated_at, done_at, overdue}`。不返回全局行 id、`created_session` 和 `reminded`。
+- `Member = User & {role, joined_at}`
+- `Binding = {session, title: string|null, bound_at}`
+- `Event = {kind: "task"|"space", task_seq: number|null, action, summary, actor_name, created_at}`：`summary` 和 `actor_name` 由服务端用 `render.event_summary` / `event_actor_name` 生成，前端只负责显示，不解析 `detail`。
+- `SpaceSummary = {id, name, owner: User|null, created_at, binding_count, member_count, task_counts:{todo,doing,done,archived}, overdue_count}`
+- `SpaceDetail = SpaceSummary & {bindings: Binding[], members: Member[], invite: {expires_at}|null}`：邀请码明文不再返回。
+
 ## 8. 公开看板
 
 - 由插件自己启动的独立 HTTP 服务提供，不经过 WebUI 端口。原因是 `/api/plug/*` 和插件页面资源都需要登录 WebUI（见 AstrBot `astrbot/dashboard/server.py` 中的 `auth_middleware`）。
@@ -299,6 +341,9 @@
 | `services/event_context.py`（M2） | 从事件取消息片段、构造 Actor；`main.py` 和 LLM 工具共用 |
 | `services/llm_tools.py`（M2） | LLM 工具（`FunctionTool` 子类），只调 `TodoService`，不直接碰存储 |
 | `services/reminders.py`（M2） | 到期提醒的选目标与标记、自动归档、后台循环；发送由 `main.py` 注入 |
+| `services/task_ops.py`（M3） | `TodoService` 与 `AdminService` 共用的任务写入规则：长度校验、字段变更与状态规则、日志 |
+| `services/admin_service.py`（M3） | WebUI 管理操作（调用者都是 AstrBot 管理员） |
+| `services/web_api.py`（M3） | WebUI 接口：路由、参数校验、序列化 |
 
 **验证口径**：
 - 在插件目录下，用 AstrBot 的 `.venv` 运行：`..\..\..\.venv\Scripts\python.exe -m pytest -q --cov=astrbot_plugin_teamtodo --cov-report=term-missing tests`。`core/` 和 `services/` 每个模块的行覆盖率都要 ≥ 80%。
