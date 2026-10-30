@@ -1,8 +1,8 @@
 // Space settings: one row per concern. Each row saves itself through the store and shows its own failure
-// (InlineError scope) right under the action. Share links are M4 and intentionally absent.
+// (InlineError scope) right under the action.
 import { ref, watch } from "../vue.js";
 import { LIMITS, ROLE_COLOR, ROLE_LABEL, describeSession, formatDateTime, userKey } from "../format.js";
-import { ask, removeSpace, renameSpace, resetInvite, setRole, state, syncMembers, unbind } from "../store.js";
+import { ask, removeSpace, renameSpace, resetInvite, setRole, shareSpace, state, syncMembers, unbind } from "../store.js";
 import CopyField from "./copy-field.js";
 import InlineError from "./inline-error.js";
 import Pill from "./pill.js";
@@ -27,6 +27,14 @@ export default {
       if (await ask({ title: "重置邀请码？", message, confirmLabel: "重置" })) await resetInvite();
     }
 
+    async function confirmShare(action) {
+      const options = {
+        reset: { title: "重置公开链接？", message: "旧链接会立即失效，已收藏旧链接的人将无法再打开；请把新链接重新发给需要的人。", confirmLabel: "重置" },
+        off: { title: "关闭分享？", message: "当前公开链接会立即失效，任何人都无法再通过它查看看板。", confirmLabel: "关闭分享", danger: true },
+      }[action];
+      if (!options || await ask(options)) await shareSpace(action);
+    }
+
     async function confirmDelete() {
       const space = state.space;
       const confirmed = await ask({
@@ -43,7 +51,7 @@ export default {
 
     return {
       state, name, LIMITS, ROLE_COLOR, ROLE_LABEL, userKey, describeSession, formatDateTime,
-      renameSpace, syncMembers, confirmUnbind, confirmReset, confirmDelete, toggleRole, freshCode, inviteExpired,
+      renameSpace, syncMembers, confirmUnbind, confirmReset, confirmShare, confirmDelete, toggleRole, freshCode, inviteExpired,
     };
   },
   template: `
@@ -125,6 +133,24 @@ export default {
         <p v-else class="row-title">当前没有有效的邀请码</p>
         <div class="panel-actions"><button type="button" class="btn" :disabled="state.pending.invite" @click="confirmReset">{{ state.pending.invite ? '处理中…' : (state.space.invite ? '重置邀请码' : '生成邀请码') }}</button></div>
         <InlineError scope="invite" />
+      </SettingsRow>
+
+      <SettingsRow title="公开链接" description="任何拿到链接的人都能只读查看此空间的看板，无需登录；看板只显示昵称，不显示用户 ID 和操作日志。">
+        <template v-if="state.space.share">
+          <CopyField v-if="state.space.share.url" label="公开链接" :value="state.space.share.url" />
+          <p v-else class="hint">已开启分享，但插件配置里还没有有效的对外访问地址，无法生成可复制的完整链接。请在插件配置中填写（以 http:// 或 https:// 开头）。</p>
+          <p class="hint">开启于 {{ formatDateTime(state.space.share.created_at) }}</p>
+        </template>
+        <p v-else class="row-title">当前没有开启公开链接</p>
+        <p v-if="!state.meta.share_available" class="hint">公开看板服务未开启，或未配置对外访问地址；请在插件配置中开启。{{ state.space.share ? '此时仍可关闭分享。' : '' }}</p>
+        <div class="panel-actions">
+          <button v-if="!state.space.share" type="button" class="btn" :disabled="!state.meta.share_available || state.pending.share" @click="confirmShare('on')">{{ state.pending.share ? '处理中…' : '开启分享' }}</button>
+          <template v-else>
+            <button type="button" class="btn" :disabled="!state.meta.share_available || state.pending.share" @click="confirmShare('reset')">重置链接</button>
+            <button type="button" class="btn btn-danger" :disabled="state.pending.share" @click="confirmShare('off')">关闭分享</button>
+          </template>
+        </div>
+        <InlineError scope="share" />
       </SettingsRow>
 
       <SettingsRow title="删除空间" description="危险操作，无法撤销。">

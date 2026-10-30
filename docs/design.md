@@ -336,7 +336,7 @@
 - 链接：`<对外访问地址>/b/<token>/`，结尾带斜杠，页面里的相对路径资源才能解析。对外访问地址去掉首尾空白和结尾的 `/`；不以 `http://` 或 `https://` 开头时视为未填写，并记 warning。
 - 分享可用 = 配置里开启了公开服务，且对外访问地址有效。只看配置，不看端口是否绑定成功（绑定失败记 error 日志）。
 - 聊天命令（全部要求空间管理员，与邀请码相同，`perms.can_manage_space`；作用于当前空间）：
-  - `share`：已分享时回复链接，否则回复“当前空间没有开启公开链接”。
+  - `share`：已分享时回复链接，否则回复“当前空间没有开启公开链接”。已有分享记录但对外访问地址无效时，回复与 `share on` 相同的不可用错误，保留原记录且不记日志；仅关闭公开服务而地址仍有效时，仍可查看原链接。
   - `share on`：分享不可用时报错“公开看板服务未开启或未配置对外访问地址，请联系 AstrBot 管理员”；已有链接时直接回复原链接，不换 token、不记日志；否则生成 token 并回复链接。
   - `share reset`：分享不可用时报同样的错；没有链接时报“当前空间还没有公开链接，用 /todo share on 开启”；否则换新 token 并回复新链接。
   - `share off`：删除链接（分享不可用时也能关）；没有链接时回复“当前空间没有开启公开链接”，不报错。
@@ -357,6 +357,15 @@
   - 所有响应带 `Referrer-Policy: no-referrer`、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`；页面另带 CSP 和禁止被嵌入框架的头。日志里不出现 token。
   - 插件 `initialize` 时按配置启动，启动失败只记日志，插件其余功能照常；`terminate` 时先停服务再关数据库。数据回调每次请求现取服务，取不到时按 404 处理。
 - WebUI：`meta` 增加 `share_available`；`SpaceDetail` 增加 `share: {url: string|null, created_at}|null`（对外访问地址无效时 `url` 为 null）；新接口 `POST spaces/<space_id>/share`，入参 `{action: "on"|"reset"|"off"}`，返回 `SpaceDetail`，规则与聊天命令相同，不可用或无链接可重置时返回 409，日志操作人记 WebUI 用户名。
+- 安全审查后的补充（opus，2026-10-31）：
+  - 昵称等于用户 ID，或是用户 ID 的前缀（至少 6 个字符）时，按“未知成员”输出。插件和多个宿主适配器在拿不到名字时会把 ID 当昵称存下。
+  - `keepalive_timeout=15`。aiohttp 不支持请求头读取超时，慢速连接攻击交给反向代理处理；配置提示和 README 不引导直接监听 `0.0.0.0`。
+  - aiohttp 服务端日志换成安静的 logger，只记异常类型和对端地址。AstrBot 的 loguru 会在 traceback 里打印局部变量，其中就有带 token 的原始请求字节。
+  - 只有连接对端是回环或内网地址时才采用 `X-Forwarded-For`；开启信任代理但监听地址不是回环地址时，启动时记 warning。
+  - 启动时把 `public.html` 和允许的 `.js`/`.css` 读进内存，请求时不读磁盘。`Server` 头改成固定值，不暴露版本。
+  - 对外访问地址用 `urlsplit` 校验：必须有主机名，不能带 query、fragment 或空白。
+  - 聊天回复的链接前面加一行“当前空间的公开看板（只读，拿到链接的人都能查看）：”。
+  - 机器人回复里的链接会被宿主以 INFO 级别写进日志，插件无法控制，README 提醒用户在分享日志前先 `reset`。
 - 公开页（`views/board/public.html` + `public-app.js`）：在 `/b/<token>/` 下用相对地址 `api/board` 取数据（`credentials: "omit"`），404 显示“链接无效或已关闭”并停止轮询，429 和网络错误按暂时失败处理。用本地静态服务器打开演示时（路径里没有 `/b/`）继续用 mock 数据，mock 模块按需动态加载，生产页面不加载。
 
 ## 9. 前端

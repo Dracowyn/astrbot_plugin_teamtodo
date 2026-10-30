@@ -1,14 +1,7 @@
-"""Business operations behind the ``/todo`` commands.
+"""Transactional business operations behind the ``/todo`` commands.
 
-Every public method runs read -> permission check -> write (+ operation log)
-inside one ``store.transaction()`` and never awaits, so concurrent commands
-cannot interleave between a check and its write. Failures raise ``TodoError``
-with a user-facing Chinese message; the transaction is rolled back.
-
-Space resolution (design 2.2): an explicit space name must be bound to the
-actor's session. Otherwise the actor's current space is used, falling back to
-the session default, then to the earliest remaining binding, and finally to a
-newly auto-created space.
+Commands resolve the actor's bound current space, check permissions and write
+state with operation logs atomically; failures raise user-facing ``TodoError``.
 """
 
 from __future__ import annotations
@@ -41,7 +34,7 @@ from ..core.models import (
 )
 from ..core.parsing import AssignOps, TaskFields, TaskRef
 from ..core.store import Store
-from . import task_ops
+from . import share, task_ops
 from .access import (
     ConfirmationCodes,
     JoinRateLimiter,
@@ -49,6 +42,7 @@ from .access import (
     is_invite_expired,
     new_invite,
 )
+from .share import ShareService
 
 PRIVATE_SPACE_NAME = "我的任务"
 MINE_STATUSES = (TaskStatus.TODO, TaskStatus.DOING)
@@ -123,6 +117,7 @@ class TodoService:
         clock: Callable[[], float] = time.time,
         join_limiter: JoinRateLimiter | None = None,
         confirmations: ConfirmationCodes | None = None,
+        share_service: ShareService | None = None,
     ) -> None:
         """Create the service.
 
@@ -132,12 +127,14 @@ class TodoService:
             clock: Wall-clock Unix seconds.
             join_limiter: Join failure limiter (a fresh one by default).
             confirmations: Confirmation code store (a fresh one by default).
+            share_service: Shared public-link service (disabled by default).
         """
         self._store = store
         self.tz = tz
         self._clock = clock
         self._joins = join_limiter or JoinRateLimiter()
         self._confirms = confirmations or ConfirmationCodes()
+        self._shares = share_service or ShareService(store, tz, clock=clock)
 
     def now(self) -> float:
         """Current Unix time in seconds."""
@@ -659,6 +656,10 @@ class TodoService:
                 raise TodoError(CONFIRM_MISMATCH)
             self._store.delete_space(space.id)
             return None
+
+    def share(self, actor: Actor, auto_name: str, action: str = "") -> str:
+        """Manage the current space's public link as a space administrator."""
+        return share.chat_share(self, actor, auto_name, action)
 
     def create_invite(self, actor: Actor, auto_name: str) -> tuple[Space, str, Invite]:
         """Reset the current space's invite as a space admin.

@@ -29,6 +29,7 @@ from astrbot_plugin_teamtodo.services.access import (
     ConfirmationCodes,
     JoinRateLimiter,
 )
+from astrbot_plugin_teamtodo.services.share import ShareService
 from astrbot_plugin_teamtodo.services.todo_service import (
     CONFIRM_MISMATCH,
     TaskUpdate,
@@ -1287,4 +1288,184 @@ def test_admin_unknown_id_removal_preserves_members_and_logs(service, store, spa
             OWNER, AUTO, AssignOps(None, (), (Mention(user("123456"), ""),))
         )
     assert store.get_member(space.id, user("123456")) is None
+    assert store.list_space_events(space.id) == baseline
+
+
+@pytest.fixture
+def sharing_service(store, clock):
+    tz = ZoneInfo("Asia/Shanghai")
+    shares = ShareService(
+        store, tz, enabled=True, base_url="https://board.example/", clock=clock
+    )
+    return TodoService(store, tz, clock=clock, share_service=shares)
+
+
+def test_share_current_space_lifecycle_and_logs(sharing_service, store, clock):
+    service = sharing_service
+    first = service.list_tasks(OWNER, AUTO).space
+    second = service.new_space(OWNER, "Second")
+    assert service.share(OWNER, AUTO) == "当前空间没有开启公开链接"
+    assert service.share(OWNER, AUTO, "off") == "当前空间没有开启公开链接"
+    baseline = store.list_space_events(second.id)
+    url = service.share(OWNER, AUTO, "on")
+    link = store.get_share(second.id)
+    assert url == (
+        "当前空间的公开看板（只读，拿到链接的人都能查看）：\n"
+        f"https://board.example/b/{link.token}/"
+    )
+    assert link.created_at == clock.now
+    assert store.get_share(first.id) is None
+    assert service.share(OWNER, AUTO) == url
+    assert service.share(OWNER, AUTO, "on") == url
+    assert len(store.list_space_events(second.id)) == len(baseline) + 1
+    clock.now += 10
+    replacement = service.share(OWNER, AUTO, "reset")
+    assert replacement != url
+    assert store.find_share(link.token) is None
+    assert store.get_share(second.id).created_at == clock.now
+    assert service.share(OWNER, AUTO, "off") == "已关闭当前空间的公开链接"
+    assert store.get_share(second.id) is None
+    assert service.share(OWNER, AUTO) == "当前空间没有开启公开链接"
+    assert service.share(OWNER, AUTO, "off") == "当前空间没有开启公开链接"
+    events = store.list_space_events(second.id)[:3]
+    assert [event.detail for event in events] == [
+        {"op": "off"},
+        {"op": "reset"},
+        {"op": "on"},
+    ]
+    assert all(event.action == SpaceEventAction.SHARE for event in events)
+    assert all(
+        event.actor == OWNER.user and event.session == GROUP_A for event in events
+    )
+    assert all(event.actor_label == "" for event in events)
+
+
+@pytest.mark.parametrize("role", ["owner", "admin", "bot_admin"])
+def test_share_allows_space_managers(sharing_service, store, role):
+    space = sharing_service.list_tasks(OWNER, AUTO).space
+    manager = OWNER
+    if role == "admin":
+        sharing_service.list_tasks(MEMBER, AUTO)
+        with store.transaction():
+            store.set_member_role(space.id, MEMBER.user, SpaceRole.ADMIN)
+        manager = MEMBER
+    elif role == "bot_admin":
+        manager = actor("bot", bot_admin=True)
+    prefix, url = sharing_service.share(manager, AUTO, "on").split("\n")
+    assert prefix == "当前空间的公开看板（只读，拿到链接的人都能查看）："
+    assert url.startswith("https://board.example/b/")
+
+
+@pytest.mark.parametrize("action", ["", "on", "reset", "off"])
+def test_share_denies_member_without_mutation(sharing_service, store, action):
+    space = sharing_service.list_tasks(OWNER, AUTO).space
+    baseline = store.list_space_events(space.id)
+    with pytest.raises(TodoError, match=DENIAL_MESSAGES[Op.MANAGE_SPACE]):
+        sharing_service.share(MEMBER, AUTO, action)
+    assert store.get_member(space.id, MEMBER.user) is None
+    assert store.get_share(space.id) is None
+    assert store.list_space_events(space.id) == baseline
+
+
+def test_share_failures_roll_back_auto_creation(service, store):
+    with pytest.raises(
+        TodoError,
+        match="公开看板服务未开启或未配置对外访问地址，请联系 AstrBot 管理员",
+    ):
+        service.share(OWNER, AUTO, "on")
+    assert store.session_space_names(GROUP_A) == {}
+    with pytest.raises(TodoError, match=DENIAL_MESSAGES[Op.MANAGE_SPACE]):
+        service.share(MEMBER, AUTO)
+    assert store.session_space_names(GROUP_A) == {}
+
+
+def test_share_reset_without_link_and_invalid_action_preserve_logs(
+    sharing_service, store
+):
+    space = sharing_service.list_tasks(OWNER, AUTO).space
+    baseline = store.list_space_events(space.id)
+    with pytest.raises(
+        TodoError, match="当前空间还没有公开链接，用 /todo share on 开启"
+    ):
+        sharing_service.share(OWNER, AUTO, "reset")
+    with pytest.raises(TodoError):
+        sharing_service.share(OWNER, AUTO, "invalid")
+    assert store.get_share(space.id) is None
+    assert store.list_space_events(space.id) == baseline
+
+
+def test_share_disabled_service_can_close_existing_link(
+    sharing_service, service, store
+):
+    space = sharing_service.list_tasks(OWNER, AUTO).space
+    sharing_service.share(OWNER, AUTO, "on")
+    baseline = store.list_space_events(space.id)
+    for action in ("on", "reset"):
+        with pytest.raises(
+            TodoError,
+            match="公开看板服务未开启或未配置对外访问地址，请联系 AstrBot 管理员",
+        ):
+            service.share(OWNER, AUTO, action)
+    assert store.list_space_events(space.id) == baseline
+    assert service.share(OWNER, AUTO, "off") == "已关闭当前空间的公开链接"
+    assert store.get_share(space.id) is None
+
+
+def test_share_log_failure_rolls_back_link(sharing_service, store, monkeypatch):
+    space = sharing_service.list_tasks(OWNER, AUTO).space
+    baseline = store.list_space_events(space.id)
+
+    def fail_log(*args, **kwargs):
+        raise RuntimeError("log failed")
+
+    monkeypatch.setattr(store, "add_space_event", fail_log)
+    with pytest.raises(RuntimeError, match="log failed"):
+        sharing_service.share(OWNER, AUTO, "on")
+    assert store.get_share(space.id) is None
+    assert store.list_space_events(space.id) == baseline
+
+
+@pytest.mark.parametrize("action", ["reset", "off"])
+def test_share_existing_link_survives_log_failure(
+    sharing_service, store, monkeypatch, action
+):
+    space = sharing_service.list_tasks(OWNER, AUTO).space
+    sharing_service.share(OWNER, AUTO, "on")
+    link = store.get_share(space.id)
+    baseline = store.list_space_events(space.id)
+
+    def fail_log(*args, **kwargs):
+        raise RuntimeError("log failed")
+
+    monkeypatch.setattr(store, "add_space_event", fail_log)
+    with pytest.raises(RuntimeError, match="log failed"):
+        sharing_service.share(OWNER, AUTO, action)
+    assert store.get_share(space.id) == link
+    assert store.list_space_events(space.id) == baseline
+
+
+@pytest.mark.parametrize("base_url", ["invalid", "https://board.example/"])
+def test_share_bare_existing_link_after_configuration_change(
+    sharing_service, store, clock, base_url
+):
+    space = sharing_service.list_tasks(OWNER, AUTO).space
+    original_url = sharing_service.share(OWNER, AUTO, "on")
+    original_link = store.get_share(space.id)
+    baseline = store.list_space_events(space.id)
+    shares = ShareService(
+        store,
+        ZoneInfo("Asia/Shanghai"),
+        enabled=False,
+        base_url=base_url,
+        clock=clock,
+    )
+    changed_service = TodoService(
+        store, ZoneInfo("Asia/Shanghai"), clock=clock, share_service=shares
+    )
+    if base_url == "invalid":
+        with pytest.raises(TodoError, match="公开看板服务未开启或未配置对外访问地址"):
+            changed_service.share(OWNER, AUTO)
+    else:
+        assert changed_service.share(OWNER, AUTO) == original_url
+    assert store.get_share(space.id) == original_link
     assert store.list_space_events(space.id) == baseline

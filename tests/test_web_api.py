@@ -12,6 +12,7 @@ from astrbot_plugin_teamtodo.core.models import (
     GroupMember,
     Mention,
     Priority,
+    SpaceEventAction,
     TaskStatus,
     TodoError,
     UserRef,
@@ -20,6 +21,7 @@ from astrbot_plugin_teamtodo.core.parsing import TaskFields, TaskRef
 from astrbot_plugin_teamtodo.core.store import Store
 from astrbot_plugin_teamtodo.services import web_api
 from astrbot_plugin_teamtodo.services.admin_service import AdminService, NotFound
+from astrbot_plugin_teamtodo.services.share import ShareConflict, ShareService
 from astrbot_plugin_teamtodo.services.todo_service import TodoService
 
 from astrbot.api.web import PluginRequest, bind_request_context
@@ -61,7 +63,7 @@ SUMMARY_KEYS = {
     "task_counts",
     "overdue_count",
 }
-DETAIL_KEYS = SUMMARY_KEYS | {"bindings", "members", "invite"}
+DETAIL_KEYS = SUMMARY_KEYS | {"bindings", "members", "invite", "share"}
 EVENT_KEYS = {"kind", "task_seq", "action", "summary", "actor_name", "created_at"}
 ROUTES = {
     ("meta", "GET"),
@@ -73,6 +75,7 @@ ROUTES = {
     ("spaces/<space_id>/members/role", "POST"),
     ("spaces/<space_id>/members/sync", "POST"),
     ("spaces/<space_id>/invite/reset", "POST"),
+    ("spaces/<space_id>/share", "POST"),
     ("spaces/<space_id>/tasks", "GET"),
     ("spaces/<space_id>/tasks", "POST"),
     ("spaces/<space_id>/tasks/<seq>", "GET"),
@@ -229,6 +232,7 @@ async def test_meta(routes):
         "server_time": NOW,
         "auto_archive_days": 7,
         "remind_before_minutes": 60,
+        "share_available": False,
         "limits": {
             "title": 200,
             "description": 4000,
@@ -426,6 +430,7 @@ async def test_space_list_and_detail_are_whitelisted(routes, seeded):
     ]
     assert all(set(m) == USER_KEYS | {"role", "joined_at"} for m in detail["members"])
     assert detail["invite"] == {"expires_at": pytest.approx(NOW + 7 * 86400)}
+    assert detail["share"] is None
     text = json.dumps(detail, ensure_ascii=False)
     assert seeded["code"] not in text
     assert "hash" not in text
@@ -893,6 +898,7 @@ class ExplodingService:
     [
         (NotFound("任务不存在"), 404, "任务不存在"),
         (TodoError("负责人必须是空间成员"), 400, "负责人必须是空间成员"),
+        (ShareConflict("sharing unavailable"), 409, "sharing unavailable"),
         (RuntimeError("secret /path/db"), 500, web_api.INTERNAL_ERROR),
     ],
 )
@@ -1099,3 +1105,186 @@ async def test_sync_members_uses_the_service_read_after_each_fetch(
     assert reply["added"] == 1
     assert old.calls == ["get_space"]
     assert new.calls == ["sync_members", "get_space"]
+
+
+def configure_sharing(holder, store, *, enabled=True, base_url="https://todo.example/"):
+    """Install a real shared-link service behind the existing API handlers."""
+    shares = ShareService(
+        store, TZ, enabled=enabled, base_url=base_url, clock=lambda: NOW
+    )
+    holder["service"] = AdminService(store, TZ, clock=lambda: NOW, share_service=shares)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enabled", "base_url", "available"),
+    [
+        (True, "https://todo.example/", True),
+        (False, "https://todo.example/", False),
+        (True, "invalid", False),
+    ],
+)
+async def test_meta_share_available_uses_configuration(
+    routes, holder, store, enabled, base_url, available
+):
+    configure_sharing(holder, store, enabled=enabled, base_url=base_url)
+    status, reply = await send(routes, "GET", "meta")
+    assert status == 200
+    assert reply["share_available"] is available
+
+
+@pytest.mark.asyncio
+async def test_share_route_lifecycle_and_username_label(routes, holder, seeded, store):
+    configure_sharing(holder, store)
+    path = "spaces/<space_id>/share"
+    status, opened = await send(
+        routes,
+        "POST",
+        path,
+        {"action": "on", "username": "spoofed"},
+        space_id="1",
+        username="  Dashboard\nOperator  ",
+    )
+    link = store.get_share(1)
+    assert status == 200
+    assert set(opened) == DETAIL_KEYS
+    assert opened["share"] == {
+        "url": f"https://todo.example/b/{link.token}/",
+        "created_at": NOW,
+    }
+    _, unchanged = await send(routes, "POST", path, {"action": "on"}, space_id="1")
+    assert unchanged == opened
+    share_events = [
+        event
+        for event in store.list_space_events(1)
+        if event.action == SpaceEventAction.SHARE
+    ]
+    assert len(share_events) == 1
+    event = store.list_space_events(1)[0]
+    assert event.actor is None
+    assert event.actor_label == "Dashboard Operator"
+    assert event.session == ""
+    assert event.detail == {"op": "on"}
+    _, detail = await send(routes, "GET", "spaces/<space_id>", space_id="1")
+    assert detail["share"] == opened["share"]
+
+    status, reset = await send(routes, "POST", path, {"action": "reset"}, space_id="1")
+    assert status == 200
+    assert reset["share"]["url"] != opened["share"]["url"]
+    assert store.find_share(link.token) is None
+    for _ in range(2):
+        status, closed = await send(
+            routes, "POST", path, {"action": "off"}, space_id="1"
+        )
+        assert status == 200
+        assert closed["share"] is None
+    assert [
+        event.detail
+        for event in store.list_space_events(1)
+        if event.action == SpaceEventAction.SHARE
+    ] == [{"op": "off"}, {"op": "reset"}, {"op": "on"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"action": None},
+        {"action": True},
+        {"action": 1},
+        {"action": []},
+        {"action": {}},
+        {"action": "ON"},
+        {"action": " on "},
+        {"action": ""},
+        {"action": "invalid"},
+    ],
+)
+async def test_share_route_rejects_invalid_actions(routes, seeded, store, body):
+    before = store.list_space_events(1)
+    status, _ = await send(
+        routes, "POST", "spaces/<space_id>/share", body, space_id="1"
+    )
+    assert status == 400
+    assert store.get_share(1) is None
+    assert store.list_space_events(1) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["on", "reset", "off"])
+@pytest.mark.parametrize(("space_id", "status"), [("0", 400), ("999", 404)])
+async def test_share_route_rejects_invalid_or_missing_space(
+    routes, seeded, action, space_id, status
+):
+    result = await send(
+        routes, "POST", "spaces/<space_id>/share", {"action": action}, space_id=space_id
+    )
+    assert result[0] == status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["on", "reset"])
+async def test_share_route_unavailable_is_conflict(routes, seeded, store, action):
+    status, reply = await send(
+        routes, "POST", "spaces/<space_id>/share", {"action": action}, space_id="1"
+    )
+    assert status == 409
+    assert reply["message"] == (
+        "公开看板服务未开启或未配置对外访问地址，请联系 AstrBot 管理员"
+    )
+    assert store.get_share(1) is None
+
+
+@pytest.mark.asyncio
+async def test_share_route_reset_requires_existing_link(routes, holder, seeded, store):
+    configure_sharing(holder, store)
+    status, reply = await send(
+        routes, "POST", "spaces/<space_id>/share", {"action": "reset"}, space_id="1"
+    )
+    assert status == 409
+    assert reply["message"] == "当前空间还没有公开链接，用 /todo share on 开启"
+
+
+@pytest.mark.asyncio
+async def test_share_detail_invalid_base_and_disable_when_unavailable(
+    routes, holder, seeded, store
+):
+    with store.transaction():
+        link = store.set_share(1, "stored-token")
+    configure_sharing(holder, store, base_url="invalid")
+    status, detail = await send(routes, "GET", "spaces/<space_id>", space_id="1")
+    assert status == 200
+    assert detail["share"] == {"url": None, "created_at": link.created_at}
+    assert store.get_share(1) == link
+    status, detail = await send(
+        routes, "POST", "spaces/<space_id>/share", {"action": "off"}, space_id="1"
+    )
+    assert status == 200
+    assert detail["share"] is None
+    assert store.get_share(1) is None
+
+
+@pytest.mark.asyncio
+async def test_share_link_only_appears_in_space_detail(routes, holder, seeded, store):
+    configure_sharing(holder, store)
+    _, opened = await send(
+        routes, "POST", "spaces/<space_id>/share", {"action": "on"}, space_id="1"
+    )
+    token = store.get_share(1).token
+    url = opened["share"]["url"]
+    replies = [
+        (await send(routes, "GET", "spaces"))[1],
+        (await send(routes, "GET", "spaces/<space_id>/tasks", space_id="1"))[1],
+        (
+            await send(
+                routes, "GET", "spaces/<space_id>/tasks/<seq>", space_id="1", seq="1"
+            )
+        )[1],
+        (await send(routes, "GET", "spaces/<space_id>/events", space_id="1"))[1],
+    ]
+    for reply in replies:
+        text = json.dumps(reply)
+        assert token not in text
+        assert url not in text
+        assert '"share":' not in text

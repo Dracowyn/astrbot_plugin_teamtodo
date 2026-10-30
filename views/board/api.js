@@ -1,4 +1,4 @@
-// Data access for the admin page (and, until M4, the public page). Every function is async and returns
+// Data access for the admin page . Every function is async and returns
 // plain JSON-shaped objects. The HTTP contract, data shapes and error rules are fixed in docs/design.md
 // section 7 ("M3 定稿"); this file only maps them to functions.
 //
@@ -11,7 +11,7 @@
 // Failures reject with an Error whose `message` is user-facing Chinese text. A rejected bridge call may
 // carry only the message and no HTTP status, so callers must show the message and never branch on `status`.
 //
-// The public page's `getPublicBoard` is the M4 endpoint (`b/<token>/api/board`) and always uses the mock for now.
+// The public page does not use this file: public-app.js fetches `api/board` itself.
 
 import { request } from "./mock.js";
 
@@ -45,8 +45,7 @@ export const listTasks = (spaceId, includeArchived = false) =>
 export const getTask = (spaceId, seq) => get(`spaces/${spaceId}/tasks/${seq}`);
 export const deleteTask = (spaceId, seq) => post(`spaces/${spaceId}/tasks/${seq}/delete`, {});
 export const listEvents = (spaceId, limit = 50) => get(`spaces/${spaceId}/events`, { limit });
-/** M4 endpoint; mock-only until the public server exists. */
-export const getPublicBoard = (token) => request("GET", `b/${encodeURIComponent(token)}/api/board`, {});
+export const shareSpace = (spaceId, action) => post(`spaces/${spaceId}/share`, { action }); // action: "on" | "reset" | "off"
 
 /** Assignees are sent as identity refs only; the server resolves nicknames. */
 const withRefs = (fields) => ("assignees" in fields ? { ...fields, assignees: fields.assignees.map(ref) } : fields);

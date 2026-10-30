@@ -42,3 +42,5 @@
   .pub-head .space-icon { --icon-size: 56px; margin-top: -28px; }
   .pub-tabs { display: flex; }
 }
+
+.pub-noscript { padding: 16px; }

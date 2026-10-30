@@ -24,6 +24,7 @@ from astrbot_plugin_teamtodo.services.admin_service import (
     NotFound,
     TaskPatch,
 )
+from astrbot_plugin_teamtodo.services.share import ShareConflict, ShareService
 
 
 @pytest.fixture
@@ -92,6 +93,7 @@ def test_detail_and_summary(env):
         lambda s: s.set_role("u", 999, UserRef("x", "x"), SpaceRole.MEMBER),
         lambda s: s.sync_members("u", 999, "chat:GroupMessage:g", []),
         lambda s: s.reset_invite("u", 999),
+        lambda s: s.set_share("u", 999, "off"),
         lambda s: s.list_tasks(999, False),
         lambda s: s.get_task(999, 1),
         lambda s: s.create_task("u", 999, title="x"),
@@ -474,3 +476,110 @@ def test_assignee_limit_for_existing_members(env):
     task = service.create_task("admin", space.id, title="task").task
     with pytest.raises(TodoError):
         service.update_task("admin", space.id, task.seq, TaskPatch(assignees=users))
+
+
+def share_admin(store, now, *, enabled=True, base_url="https://todo.example/root/"):
+    """Build an administrator service with configured shared-link rules."""
+    shares = ShareService(
+        store,
+        timezone.utc,
+        enabled=enabled,
+        base_url=base_url,
+        clock=lambda: now[0],
+    )
+    return AdminService(store, timezone.utc, clock=lambda: now[0], share_service=shares)
+
+
+def test_share_lifecycle_and_noop_logs(env):
+    _, store, space, *_, now = env
+    service = share_admin(store, now)
+    assert service.share_available is True
+    assert service.get_space(space.id).share is None
+    assert service.set_share("operator", space.id, "off").share is None
+    assert store.list_space_events(space.id) == []
+
+    first = service.set_share("operator", space.id, "on")
+    link = store.get_share(space.id)
+    assert first.share.url == f"https://todo.example/root/b/{link.token}/"
+    assert first.share.created_at == now[0]
+    assert service.set_share("operator", space.id, "on") == first
+    assert len(store.list_space_events(space.id)) == 1
+
+    now[0] += 1
+    reset = service.set_share("operator", space.id, "reset")
+    assert reset.share.url != first.share.url
+    assert reset.share.created_at == now[0]
+    assert store.find_share(link.token) is None
+    now[0] += 1
+    assert service.set_share("operator", space.id, "off").share is None
+    assert service.set_share("operator", space.id, "off").share is None
+    events = store.list_space_events(space.id)
+    assert [event.detail for event in events] == [
+        {"op": "off"},
+        {"op": "reset"},
+        {"op": "on"},
+    ]
+    assert all(event.action == SpaceEventAction.SHARE for event in events)
+    assert all(
+        event.actor is None and event.actor_label == "operator" and event.session == ""
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    ("enabled", "base_url", "available", "has_url"),
+    [
+        (True, "https://todo.example/", True, True),
+        (False, "https://todo.example/", False, True),
+        (True, "", False, False),
+        (True, "todo.example", False, False),
+    ],
+)
+def test_share_detail_uses_configuration_without_changing_rows(
+    env, enabled, base_url, available, has_url
+):
+    _, store, space, *_, now = env
+    with store.transaction():
+        link = store.set_share(space.id, "stored-token")
+    service = share_admin(store, now, enabled=enabled, base_url=base_url)
+    assert service.share_available is available
+    detail = service.get_space(space.id)
+    assert (detail.share.url is not None) is has_url
+    assert detail.share.created_at == link.created_at
+    assert store.get_share(space.id) == link
+    assert store.list_space_events(space.id) == []
+    if not available:
+        for action in ("on", "reset"):
+            with pytest.raises(ShareConflict) as exc:
+                service.set_share("operator", space.id, action)
+            assert str(exc.value) == (
+                "公开看板服务未开启或未配置对外访问地址，请联系 AstrBot 管理员"
+            )
+        assert store.get_share(space.id) == link
+    assert service.set_share("operator", space.id, "off").share is None
+
+
+def test_share_reset_without_link_and_invalid_action(env):
+    _, store, space, *_, now = env
+    service = share_admin(store, now)
+    with pytest.raises(ShareConflict) as exc:
+        service.set_share("operator", space.id, "reset")
+    assert str(exc.value) == "当前空间还没有公开链接，用 /todo share on 开启"
+    with pytest.raises(TodoError):
+        service.set_share("operator", space.id, "invalid")
+    assert store.get_share(space.id) is None
+    assert store.list_space_events(space.id) == []
+
+
+def test_share_log_failure_rolls_back_link(env, monkeypatch):
+    _, store, space, *_, now = env
+    service = share_admin(store, now)
+
+    def fail_log(*args, **kwargs):
+        raise RuntimeError("log write failed")
+
+    monkeypatch.setattr(store, "add_space_event", fail_log)
+    with pytest.raises(RuntimeError):
+        service.set_share("operator", space.id, "on")
+    assert store.get_share(space.id) is None
+    assert store.list_space_events(space.id) == []

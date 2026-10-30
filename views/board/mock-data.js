@@ -58,7 +58,7 @@ export const SPACES = [
       member(USERS.eric, "member", 8),
     ],
     invite: { expires_at: NOW + 5 * DAY },
-    share: { enabled: true, token: "Zx3kQ8vN2mLp7RtY5wBcHa" },
+    share: { token: "Zx3kQ8vN2mLp7RtY5wBcHa", created_at: NOW - 3 * DAY },
   },
   {
     id: 2,
@@ -68,7 +68,7 @@ export const SPACES = [
     bindings: [{ session: PRIVATE_YUTONG, title: "林雨桐", bound_at: NOW - 40 * DAY }],
     members: [member(USERS.yutong, "owner", 40)],
     invite: null,
-    share: { enabled: false, token: "Qm7dJ2xKp9VwR4tYe1NsLc" },
+    share: null,
   },
   {
     id: 3,
@@ -78,7 +78,7 @@ export const SPACES = [
     bindings: [],
     members: [member(USERS.jiayi, "owner", 14), member(USERS.zimo, "member", 13), member(USERS.mingzhe, "member", 12)],
     invite: null,
-    share: { enabled: false, token: "Hb5nT8wLc3XsP6qZy2KdRv" },
+    share: null,
   },
 ];
 

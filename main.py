@@ -21,6 +21,7 @@ import re
 import time
 from collections.abc import Callable
 from datetime import timedelta, timezone, tzinfo
+from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import astrbot.api.message_components as Comp
@@ -62,6 +63,7 @@ from .services.event_context import (
     message_parts,
 )
 from .services.llm_tools import TeamTodoToolkit
+from .services.public_server import PublicServer
 from .services.reminders import Reminder, ReminderService, run_loop
 from .services.render import (
     format_due,
@@ -73,6 +75,7 @@ from .services.render import (
     task_line,
     task_list,
 )
+from .services.share import ShareService, normalize_base_url
 from .services.todo_service import TodoService, auto_space_name
 from .services.web_api import WebApi
 
@@ -140,6 +143,32 @@ class TeamTodoPlugin(Star):
         self._store: Store | None = None
         self._service: TodoService | None = None
         self._admin_service: AdminService | None = None
+        self._share_service: ShareService | None = None
+        self._public_server: PublicServer | None = None
+        self._public_enabled = bool(config.get("public_enabled", False))
+        self._public_host = str(config.get("public_host") or "127.0.0.1")
+        raw_base_url = str(config.get("public_base_url") or "")
+        self._public_base_url = normalize_base_url(raw_base_url)
+        if raw_base_url.strip() and not self._public_base_url:
+            logger.warning(
+                "[teamtodo] Invalid public_base_url; public links are unavailable"
+            )
+        self._public_trust_proxy = bool(config.get("public_trust_proxy", False))
+        public_limits = {}
+        for key, default, maximum in (
+            ("public_port", 6200, 65535),
+            ("public_rate_limit", 60, None),
+        ):
+            try:
+                value = int(config.get(key, default))
+                if value < 1 or (maximum is not None and value > maximum):
+                    raise ValueError
+            except (TypeError, ValueError):
+                logger.warning("[teamtodo] Invalid %s; using %s", key, default)
+                value = default
+            public_limits[key] = value
+        self._public_port = public_limits["public_port"]
+        self._public_rate_limit = public_limits["public_rate_limit"]
         self._resolver = SessionAdminResolver()
         self._joins = JoinRateLimiter()
         self._confirms = ConfirmationCodes()
@@ -184,13 +213,22 @@ class TeamTodoPlugin(Star):
         """Open the database, build the services and start the reminder loop."""
         db_path = StarTools.get_data_dir(PLUGIN_NAME) / "teamtodo.db"
         self._store = Store(db_path)
+        self._share_service = ShareService(
+            self._store,
+            self._tz,
+            enabled=self._public_enabled,
+            base_url=self._public_base_url,
+        )
         self._service = TodoService(
             self._store,
             self._tz,
             join_limiter=self._joins,
             confirmations=self._confirms,
+            share_service=self._share_service,
         )
-        self._admin_service = AdminService(self._store, self._tz)
+        self._admin_service = AdminService(
+            self._store, self._tz, share_service=self._share_service
+        )
         reminders = ReminderService(
             self._store,
             lead_seconds=self._remind_minutes * 60,
@@ -199,9 +237,34 @@ class TeamTodoPlugin(Star):
         self._reminder_task = asyncio.create_task(
             run_loop(reminders, self._send_reminder)
         )
+        if self._public_enabled:
+            self._public_server = PublicServer(
+                lambda token: (
+                    self._share_service.board_for_token(token)
+                    if self._service is not None and self._share_service is not None
+                    else None
+                ),
+                Path(__file__).parent / "views" / "board",
+                host=self._public_host,
+                port=self._public_port,
+                rate_limit_per_minute=self._public_rate_limit,
+                trust_proxy=self._public_trust_proxy,
+            )
+            try:
+                await self._public_server.start()
+            except OSError as exc:
+                logger.error(
+                    "[teamtodo] Failed to start public board server on %s:%s: %s",
+                    self._public_host,
+                    self._public_port,
+                    exc.strerror or exc.errno or type(exc).__name__,
+                )
 
     async def terminate(self) -> None:
-        """Stop the reminder loop, then close the database."""
+        """Stop the public server and reminder loop before closing the database."""
+        server, self._public_server = self._public_server, None
+        if server is not None:
+            await server.stop()
         task, self._reminder_task = self._reminder_task, None
         if task is not None:
             task.cancel()
@@ -212,6 +275,7 @@ class TeamTodoPlugin(Star):
                     logger.exception("[teamtodo] Reminder loop ended with an error")
         self._service = None
         self._admin_service = None
+        self._share_service = None
         if self._store is not None:
             self._store.close()
             self._store = None
@@ -335,6 +399,7 @@ class TeamTodoPlugin(Star):
             "spaces": self._spaces,
             "use": self._use,
             "default": self._default,
+            "share": self._share,
             "space new": self._space_new,
             "space rename": self._space_rename,
             "space delete": self._space_delete,
@@ -356,6 +421,16 @@ class TeamTodoPlugin(Star):
         if not words:
             raise TodoError(f"用法：{usage}")
         return words
+
+    def _share(self, actor: Actor, auto_name: str, args: list[Part]) -> str:
+        """Parse the public-link action and delegate permission and changes."""
+        if any(not isinstance(part, str) for part in args):
+            raise TodoError("用法：/todo share [on|off|reset]")
+        words = text_of(args).split()
+        action = words[0].casefold() if words else ""
+        if len(words) > 1 or action not in ("", "on", "off", "reset"):
+            raise TodoError("用法：/todo share [on|off|reset]")
+        return self._service.share(actor, auto_name, action)
 
     # ----- task commands -----
 

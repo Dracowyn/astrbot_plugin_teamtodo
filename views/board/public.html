@@ -14,10 +14,10 @@
 <link rel="stylesheet" href="./css/public.css">
 </head>
 <body>
-<!-- Asset URLs are relative on purpose: the M4 server serves this page at /b/<token>/ and the same directory
+<!-- No inline scripts or style attributes: the server's CSP forbids them. Asset URLs are relative on purpose: the server serves this page at /b/<token>/ and the same directory
      (css/, components/, vendor/) below it, so the token travels in the path and no ../ is needed. -->
 <div id="app"></div>
-<noscript><p style="padding:16px">需要启用 JavaScript 才能查看看板。</p></noscript>
+<noscript><p class="pub-noscript">需要启用 JavaScript 才能查看看板。</p></noscript>
 <script type="module" src="./public-app.js"></script>
 </body>
 </html>

@@ -307,6 +307,14 @@ export async function resetInvite() {
   if (space) state.space = space;
 }
 
+/** Public link: action is "on" | "reset" | "off"; the server answers with the fresh SpaceDetail. */
+export async function shareSpace(action) {
+  const space = await attempt(() => api.shareSpace(state.spaceId, action), "share");
+  if (!space) return;
+  state.space = space;
+  notify({ on: "已开启公开链接", reset: "已重置公开链接", off: "已关闭分享" }[action]);
+}
+
 export async function removeSpace() {
   const gone = await attempt(() => api.deleteSpace(state.spaceId), "delete");
   if (!gone) return;

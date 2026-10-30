@@ -1,7 +1,7 @@
 // One task card: number and priority on top, the title, neutral tag pills, then a footer with the relative due chip and overlapping avatars.
 // Shared by the admin board (editable: click/Enter opens the side peek, draggable) and the public board
 // (read-only: the description can be expanded in place). Overdue has exactly one signal: red due text
-// (admin: the server's `overdue` flag; public board: computed client-side until M4).
+// (the server's `overdue` flag; computed client-side only when a payload lacks it).
 import { computed, ref } from "../vue.js";
 import { PRIORITY_LABEL, STATUS_LABEL, describeDue, isOverdue } from "../format.js";
 import Avatar from "./avatar.js";
@@ -20,7 +20,7 @@ export default {
   emits: ["open", "move-key"],
   setup(props, { emit }) {
     const expanded = ref(false);
-    const overdue = computed(() => (props.editable ? props.task.overdue === true : isOverdue(props.task, props.now)));
+    const overdue = computed(() => (typeof props.task.overdue === "boolean" ? props.task.overdue : isOverdue(props.task, props.now)));
     const due = computed(() => (props.task.due_at == null ? null : describeDue(props.task.due_at, props.now, {
       open: props.task.status === "todo" || props.task.status === "doing", overdue: overdue.value,
     })));
@@ -56,7 +56,7 @@ export default {
         <span v-if="due" class="due-chip num" :class="due.tone && 'is-' + due.tone"><Icon name="calendar" /><span class="visually-hidden">截止 </span>{{ due.text }}</span>
         <span v-if="task.assignees.length" class="card-people">
           <span class="visually-hidden">负责人 {{ task.assignees.map((a) => a.nickname).join('、') }}</span>
-          <Avatar v-for="a in task.assignees.slice(0, 4)" :key="a.platform_id + a.user_id" :name="a.nickname" />
+          <Avatar v-for="(a, i) in task.assignees.slice(0, 4)" :key="i + (a.user_id || a.nickname)" :name="a.nickname" />
           <span v-if="task.assignees.length > 4" class="card-more num" aria-hidden="true">+{{ task.assignees.length - 4 }}</span>
           <span v-if="task.assignees.length === 1" class="card-name" aria-hidden="true">{{ task.assignees[0].nickname }}</span>
         </span>

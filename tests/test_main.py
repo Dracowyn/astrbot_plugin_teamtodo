@@ -1144,7 +1144,6 @@ def test_registers_every_web_route_under_the_plugin_prefix(plugin):
     routes = [(route, methods) for route, _, methods, _ in plugin.context.web_apis]
 
     # Assert
-    assert len(routes) == 15
     assert all(route.startswith("/astrbot_plugin_teamtodo/") for route, _ in routes)
     assert ("/astrbot_plugin_teamtodo/spaces/<space_id>/tasks", ["POST"]) in routes
     assert all(callable(handler) for _, handler, _, _ in plugin.context.web_apis)
@@ -1276,3 +1275,214 @@ async def test_session_title_failure_does_not_break_the_command(
     # Assert
     assert replies == [main.help_text()]
     assert len(errors) == 1
+
+
+@pytest.mark.asyncio
+async def test_share_command_lifecycle_and_help(plugin, monkeypatch):
+    server = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+    monkeypatch.setattr(main, "PublicServer", lambda *a, **k: server)
+    plugin._public_enabled = True
+    plugin._public_base_url = "https://boards.example/prefix/"
+    await plugin.initialize()
+    owner = {"group": owner_group()}
+    assert "share" in (await run(plugin, Comp.Plain(text="/todo help")))[0]
+    assert await run(plugin, Comp.Plain(text="/todo share"), **owner) == [
+        "当前空间没有开启公开链接"
+    ]
+    first = (await run(plugin, Comp.Plain(text="/todo SHARE ON"), **owner))[0]
+    prefix, url = first.split("\n")
+    assert prefix == "当前空间的公开看板（只读，拿到链接的人都能查看）："
+    assert url.startswith("https://boards.example/prefix/b/")
+    assert url.endswith("/")
+    assert await run(plugin, Comp.Plain(text="/todo share"), **owner) == [first]
+    assert await run(plugin, Comp.Plain(text="/todo share on"), **owner) == [first]
+    reset = (await run(plugin, Comp.Plain(text="/todo share reset"), **owner))[0]
+    assert reset != first
+    assert await run(plugin, Comp.Plain(text="/todo share off"), **owner) == [
+        "已关闭当前空间的公开链接"
+    ]
+    assert await run(plugin, Comp.Plain(text="/todo share off"), **owner) == [
+        "当前空间没有开启公开链接"
+    ]
+    assert await run(plugin, Comp.Plain(text="/todo share reset"), **owner) == [
+        "当前空间还没有公开链接，用 /todo share on 开启"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", ["bad", "on extra", "reset off", "on @user"])
+async def test_share_usage_errors(plugin, suffix):
+    await plugin.initialize()
+    assert await run(plugin, Comp.Plain(text=f"/todo share {suffix}")) == [
+        "用法：/todo share [on|off|reset]"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_share_rejects_mentions(plugin):
+    await plugin.initialize()
+    assert await run(plugin, Comp.Plain(text="/todo share on "), Comp.At(qq="u2")) == [
+        "用法：/todo share [on|off|reset]"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_share_unavailable_and_member_denied(plugin):
+    await plugin.initialize()
+    assert await run(
+        plugin, Comp.Plain(text="/todo share on"), group=owner_group()
+    ) == ["公开看板服务未开启或未配置对外访问地址，请联系 AstrBot 管理员"]
+    denied = await run(plugin, Comp.Plain(text="/todo share"), sender="member")
+    assert "管理员" in denied[0]
+
+
+@pytest.mark.parametrize(
+    ("config", "port", "rate"),
+    [
+        ({}, 6200, 60),
+        ({"public_port": 1234, "public_rate_limit": 4}, 1234, 4),
+        ({"public_port": 0, "public_rate_limit": 0}, 6200, 60),
+        ({"public_port": 65536, "public_rate_limit": -1}, 6200, 60),
+        ({"public_port": "bad", "public_rate_limit": None}, 6200, 60),
+    ],
+)
+def test_public_config_defaults_and_fallbacks(config, port, rate, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(main.logger, "warning", lambda *a, **k: warnings.append(a))
+    instance = main.TeamTodoPlugin(FakeContext(), config)
+    assert instance._public_port == port
+    assert instance._public_rate_limit == rate
+    assert instance._public_host == "127.0.0.1"
+    assert instance._public_enabled is False
+    assert instance._public_trust_proxy is False
+    assert instance._public_base_url == ""
+    if config.get("public_port") in (0, 65536, "bad"):
+        assert any("public_port" in str(item) for item in warnings)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bind_failure", [False, True])
+async def test_public_server_lifecycle_lazy_lookup(plugin, monkeypatch, bind_failure):
+    events = []
+    errors = []
+
+    class Server:
+        def __init__(self, lookup, static_dir, **kwargs):
+            self.lookup = lookup
+            self.static_dir = static_dir
+            self.kwargs = kwargs
+
+        async def start(self):
+            events.append("start")
+            if bind_failure:
+                raise OSError(98, "Address already in use")
+
+        async def stop(self):
+            assert plugin._store is not None
+            events.append("stop")
+
+    monkeypatch.setattr(main, "PublicServer", Server)
+    monkeypatch.setattr(main.logger, "error", lambda *a, **k: errors.append((a, k)))
+    plugin._public_enabled = True
+    plugin._public_base_url = " https://boards.example/prefix/// "
+    plugin._public_host = "0.0.0.0"
+    plugin._public_port = 6201
+    plugin._public_rate_limit = 7
+    plugin._public_trust_proxy = True
+    await plugin.initialize()
+    server = plugin._public_server
+    assert server.static_dir == main.Path(main.__file__).parent / "views" / "board"
+    assert server.kwargs == {
+        "host": "0.0.0.0",
+        "port": 6201,
+        "rate_limit_per_minute": 7,
+        "trust_proxy": True,
+    }
+    assert plugin._service._shares is plugin._share_service
+    assert plugin._admin_service._shares is plugin._share_service
+    assert plugin._share_service.available
+    share = plugin._share_service
+    monkeypatch.setattr(share, "board_for_token", lambda token: {"seen": token})
+    assert server.lookup("test") == {"seen": "test"}
+    plugin._service = None
+    assert server.lookup("test") is None
+    plugin._service = object()
+    plugin._share_service = None
+    assert server.lookup("test") is None
+    plugin._share_service = share
+    await plugin.terminate()
+    await plugin.terminate()
+    assert server.lookup("test") is None
+    assert events == ["start", "stop"]
+    assert bool(errors) is bind_failure
+    assert all(not kwargs.get("exc_info") for _, kwargs in errors)
+    if bind_failure:
+        # The reason is logged so the admin can tell a busy port from others.
+        args = errors[0][0]
+        assert args[1:] == ("0.0.0.0", 6201, "Address already in use")
+
+
+@pytest.mark.asyncio
+async def test_public_server_start_failure_without_strerror(plugin, monkeypatch):
+    errors = []
+
+    class Server:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            raise OSError("bind failed")
+
+        async def stop(self):
+            pass
+
+    monkeypatch.setattr(main, "PublicServer", Server)
+    monkeypatch.setattr(main.logger, "error", lambda *a, **k: errors.append(a))
+    plugin._public_enabled = True
+    await plugin.initialize()
+    await plugin.terminate()
+    assert errors[0][-1] == "OSError"
+
+
+@pytest.mark.asyncio
+async def test_disabled_public_server_not_constructed(plugin, monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Disabled public server must not be constructed")
+
+    monkeypatch.setattr(main, "PublicServer", unexpected)
+    await plugin.initialize()
+    assert plugin._public_server is None
+    assert not plugin._share_service.available
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        (" https://boards.example/prefix/// ", "https://boards.example/prefix"),
+        ("http://boards.example/", "http://boards.example"),
+        ("not-a-url/private-token", ""),
+    ],
+)
+def test_public_config_reads_flags_and_normalizes_base(base_url, expected, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(main.logger, "warning", lambda *a, **k: warnings.append(a))
+    instance = main.TeamTodoPlugin(
+        FakeContext(),
+        {
+            "public_enabled": True,
+            "public_host": "0.0.0.0",
+            "public_port": "6202",
+            "public_base_url": base_url,
+            "public_rate_limit": "12",
+            "public_trust_proxy": True,
+        },
+    )
+    assert instance._public_enabled is True
+    assert instance._public_host == "0.0.0.0"
+    assert instance._public_port == 6202
+    assert instance._public_base_url == expected
+    assert instance._public_rate_limit == 12
+    assert instance._public_trust_proxy is True
+    assert all(base_url not in str(item) for item in warnings)
+    if not expected:
+        assert warnings

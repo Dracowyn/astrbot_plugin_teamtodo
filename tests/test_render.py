@@ -279,7 +279,7 @@ def test_spaces_list_preserves_rows_and_marks_default_and_current_independently(
     assert spaces_list([]) == ""
 
 
-def test_help_lists_every_m1_command_and_does_not_advertise_m4_share():
+def test_help_lists_task_space_and_share_commands():
     text = help_text()
     assert "/todo" in text
     for command in (
@@ -310,10 +310,27 @@ def test_help_lists_every_m1_command_and_does_not_advertise_m4_share():
         "admin",
     ):
         assert command in text
-    assert "share" not in text.lower()
+    assert "/todo share [on|off|reset]" in text
     assert "确认码" in text
     assert "!高" in text and "!中" in text and "!低" in text
     assert "@" in text and "标签" in text
+
+
+@pytest.mark.parametrize(
+    "op,expected",
+    [("on", "开启公开链接"), ("reset", "重置公开链接"), ("off", "关闭公开链接")],
+)
+def test_share_event_summary(op, expected):
+    event = make_event(SpaceEventAction.SHARE, {"op": op}, space=True)
+    assert event_summary(event, {}, UTC) == expected
+
+
+@pytest.mark.parametrize(
+    "detail", [{}, {"op": "unknown"}, {"op": []}, {"op": None}, [], None]
+)
+def test_share_event_summary_malformed_detail_falls_back(detail):
+    event = make_event(SpaceEventAction.SHARE, detail, space=True)
+    assert event_summary(event, {}, UTC) == str(SpaceEventAction.SHARE)
 
 
 @pytest.mark.parametrize(

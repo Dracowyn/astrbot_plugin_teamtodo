@@ -1,7 +1,8 @@
-// Public read-only board. In M4 the plugin's own HTTP server serves this file and the shared
-// components from the same directory; until then it runs on mock data (token from ?t=).
+// Public read-only board. In production the plugin's own HTTP server serves this file and the shared
+// components at /b/<token>/ and the data comes from the relative URL `api/board`. Without `/b/` in the path
+// (local static preview) it runs on mock data, loaded on demand so the production page never requests it.
+// Keep the static imports minimal: no api.js / store.js here.
 import { computed, createApp, onBeforeUnmount, onMounted, ref } from "./vue.js";
-import { getPublicBoard } from "./api.js";
 import { STATUSES, formatRelative, nowSeconds, setTimeZone, toneClass } from "./format.js";
 import KanbanBoard from "./components/board.js";
 import Meter from "./components/meter.js";
@@ -15,6 +16,25 @@ const TOKEN_IN_PATH = /\/b\/([^/]+)/;
 function readToken() {
   const fromPath = TOKEN_IN_PATH.exec(location.pathname);
   return fromPath ? decodeURIComponent(fromPath[1]) : new URLSearchParams(location.search).get("t") || "";
+}
+
+const IS_DEMO = !TOKEN_IN_PATH.test(location.pathname);
+
+/**
+ * Fetches the board snapshot. Rejects with `.status` = 404 when the link is invalid or closed; every other
+ * failure (429, 5xx, network, malformed body) is transient and the caller keeps polling.
+ */
+async function fetchBoard(token) {
+  if (IS_DEMO) {
+    const { request } = await import("./mock.js");
+    return request("GET", `b/${encodeURIComponent(token)}/api/board`, {});
+  }
+  const response = await fetch("api/board", { credentials: "omit", cache: "no-store", headers: { Accept: "application/json" } });
+  if (response.status === 404) throw Object.assign(new Error("链接无效或已关闭"), { status: 404 });
+  if (!response.ok) throw Object.assign(new Error(`HTTP ${response.status}`), { status: response.status });
+  const data = await response.json();
+  if (!data?.space || !Array.isArray(data.tasks)) throw new Error("看板数据格式不正确");
+  return data;
 }
 
 const App = {
@@ -46,18 +66,23 @@ const App = {
       clearTimeout(pollTimer);
       refreshing.value = state.value === "ok";
       try {
-        const data = await getPublicBoard(token);
+        const data = await fetchBoard(token);
         setTimeZone(data.timezone);
         board.value = data;
         state.value = "ok";
         refreshFailed.value = false;
         document.title = `${data.space.name} · 团队待办`;
       } catch (err) {
-        if (state.value === "ok") refreshFailed.value = true;
+        if (err?.status === 404) {
+          // Closed or reset while the page was open: drop the stale board and stop polling.
+          linkClosed.value = true;
+          board.value = null;
+          state.value = "error";
+          errorMessage.value = "链接无效或已关闭";
+        } else if (state.value === "ok") refreshFailed.value = true;
         else {
           state.value = "error";
-          linkClosed.value = err?.status === 404;
-          errorMessage.value = linkClosed.value ? "链接无效或已关闭" : "暂时无法加载，请稍后重试";
+          errorMessage.value = "暂时无法加载，请稍后重试";
         }
       } finally {
         refreshing.value = false;

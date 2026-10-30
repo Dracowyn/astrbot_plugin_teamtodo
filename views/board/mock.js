@@ -7,6 +7,10 @@ import { LIMITS, PRIORITY_LABEL, STATUS_LABEL, describeSession, formatDateTime, 
 
 const LATENCY_MS = 70;
 const INVITE_TTL_SECONDS = 7 * 86400;
+const SHARE_BASE_URL = "http://127.0.0.1:6200";
+const SHARE_TOKEN_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+// Demo-only `?mockShare=off` simulates share_available=false (public server disabled or no external URL).
+const SHARE_AVAILABLE = new URLSearchParams(location.search).get("mockShare") !== "off";
 const INVITE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const ADMIN_LABEL = "admin（WebUI）";
 const MOCK_FAIL = new URLSearchParams(location.search).get("mockFail");
@@ -70,6 +74,7 @@ function detail(space) {
     bindings: space.bindings,
     members: space.members,
     invite: space.invite && space.invite.expires_at > nowSeconds() ? { expires_at: space.invite.expires_at } : null,
+    share: space.share ? { url: `${SHARE_BASE_URL}/b/${space.share.token}/`, created_at: space.share.created_at } : null,
   };
 }
 
@@ -251,15 +256,39 @@ function syncMembers(space) {
   return { added, results, detail: detail(space) };
 }
 
+// Same rules as the real service: "on" keeps an existing link, "reset" needs one, "off" is a no-op without one.
+function shareAction(space, action) {
+  const makeShare = () => ({ token: randomString(SHARE_TOKEN_ALPHABET, 32), created_at: nowSeconds() });
+  if (!["on", "reset", "off"].includes(action)) fail(400, "操作无效");
+  if (action === "off") {
+    if (space.share) {
+      space.share = null;
+      log(space.id, null, "share", "关闭了公开链接");
+    }
+    return;
+  }
+  if (!SHARE_AVAILABLE) fail(409, "公开看板服务未开启或未配置对外访问地址，请联系 AstrBot 管理员");
+  if (action === "on") {
+    if (space.share) return;
+    space.share = makeShare();
+    log(space.id, null, "share", "开启了公开链接");
+    return;
+  }
+  if (!space.share) fail(409, "当前空间还没有公开链接，请先开启分享");
+  space.share = makeShare();
+  log(space.id, null, "share", "重置了公开链接");
+}
+
 // ---- public board ----
 
 function publicBoard(token) {
-  const space = spaces.find((s) => s.share.enabled && s.share.token === token);
+  const space = spaces.find((s) => s.share && s.share.token === token);
   if (!space) fail(404, "链接无效或已关闭");
   // Field whitelist: nicknames only, no IDs, no creator, no sessions, no log.
   const visible = tasks.filter((t) => t.space_id === space.id && t.status !== "archived").map((t) => ({
     seq: t.seq, title: t.title, status: t.status, assignees: t.assignees.map((a) => ({ nickname: a.nickname })),
     due_at: t.due_at, tags: t.tags, priority: t.priority, description: t.description, done_at: t.done_at, updated_at: t.updated_at,
+    overdue: isOverdue(t, nowSeconds()),
   }));
   const updated = Math.max(space.created_at, ...visible.map((t) => t.updated_at));
   return { space: { name: space.name }, tasks: visible, updated_at: updated, server_time: nowSeconds(), timezone: TIMEZONE };
@@ -270,7 +299,7 @@ function publicBoard(token) {
 const META_LIMITS = { title: LIMITS.title, description: LIMITS.description, tag: LIMITS.tag, tags: LIMITS.tags, assignees: LIMITS.assignees, space_name: LIMITS.spaceName };
 
 const routes = [
-  ["GET", /^meta$/, () => ({ timezone: TIMEZONE, server_time: nowSeconds(), auto_archive_days: 7, remind_before_minutes: 30, limits: META_LIMITS })],
+  ["GET", /^meta$/, () => ({ timezone: TIMEZONE, server_time: nowSeconds(), auto_archive_days: 7, share_available: SHARE_AVAILABLE, remind_before_minutes: 30, limits: META_LIMITS })],
   ["GET", /^spaces$/, () => ({ spaces: spaces.map(summarize) })],
   ["GET", /^spaces\/(\d+)$/, (m) => detail(getSpace(m[1]))],
   ["POST", /^spaces\/(\d+)\/rename$/, (m, body) => { const s = getSpace(m[1]); rename(s, body.name); return detail(s); }],
@@ -295,6 +324,7 @@ const routes = [
     log(s.id, null, "invite", "重置了邀请码");
     return { code: randomString(INVITE_ALPHABET, 12), expires_at: s.invite.expires_at };
   }],
+  ["POST", /^spaces\/(\d+)\/share$/, (m, body) => { const s = getSpace(m[1]); shareAction(s, body.action); return detail(s); }],
   ["GET", /^spaces\/(\d+)\/tasks$/, (m, params) => {
     const s = getSpace(m[1]);
     const include = [true, 1, "1"].includes(params.include_archived);

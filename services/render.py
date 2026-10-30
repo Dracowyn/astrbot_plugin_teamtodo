@@ -266,6 +266,14 @@ def event_summary(
         elif event.action == SpaceEventAction.INVITE:
             expires = _event_time(detail["expires_at"], event.created_at, tz)
             return f"重置邀请码，有效期至 {expires}"
+        elif event.action == SpaceEventAction.SHARE:
+            op = detail["op"]
+            if isinstance(op, str):
+                return {
+                    "on": "开启公开链接",
+                    "reset": "重置公开链接",
+                    "off": "关闭公开链接",
+                }.get(op, fallback)
     except (KeyError, TypeError, ValueError, OverflowError, OSError):
         return fallback
     return fallback
@@ -397,6 +405,7 @@ def help_text() -> str:
             "/todo space rename <新名字>：重命名当前空间",
             "/todo space delete <空间名> [确认码]：删除空间，需在 60 秒内二次确认",
             "/todo invite：重置当前空间邀请码，旧码失效",
+            "/todo share [on|off|reset]：查看、开启、关闭或重置当前空间公开链接（空间管理员）",
             "/todo join <邀请码>：将本会话绑定到对应空间",
             "/todo leave <空间名>：解绑本会话与空间",
             "/todo claim：认领当前无主空间",

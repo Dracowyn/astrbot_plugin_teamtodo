@@ -1,4 +1,4 @@
-"""WebUI management API (design 7, "M3 定稿"): routes, validation, serialization.
+"""WebUI management API (design 7 and M4): routes, validation, serialization.
 
 Handlers are registered by ``main.py`` through ``context.register_web_api``;
 they are not ``@filter`` handlers, so they may live here. AstrBot matches them
@@ -16,10 +16,10 @@ unknown keys are ignored. Responses are built from explicit field whitelists:
 no row ids, creating sessions, reminder flags or invite codes/hashes (the
 plain invite code is returned once, by ``invite/reset``).
 
-Status codes: 400 invalid input or a ``TodoError``, 404 ``NotFound``, 503 the
-plugin is not initialized (or was terminated / uninstalled: AstrBot never
-unregisters web routes, so stale handlers must fail cleanly), 500 anything
-else with a fixed message (details only in the log).
+Status codes: 400 invalid input or a ``TodoError``, 404 ``NotFound``, 409
+``ShareConflict``, 503 the plugin is not initialized (or was terminated /
+uninstalled: AstrBot never unregisters web routes, so stale handlers must fail
+cleanly), 500 anything else with a fixed message (details only in the log).
 """
 
 from __future__ import annotations
@@ -59,6 +59,7 @@ from .admin_service import (
 )
 from .event_context import PLUGIN_NAME
 from .render import event_actor_name, event_summary
+from .share import ShareConflict
 
 MAX_ID = 2_000_000_000
 """Largest accepted space id or task number in a path."""
@@ -265,7 +266,7 @@ def _summary(
 
 
 def _detail(detail: SpaceDetail) -> dict[str, Any]:
-    """``SpaceDetail``: only the invite's expiry, never its code or hash."""
+    """Serialize space detail, exposing links only in its dedicated share field."""
     nicknames = {m.user.key: m.nickname for m in detail.members if m.nickname}
     return {
         **_summary(detail.summary, nicknames),
@@ -280,6 +281,11 @@ def _detail(detail: SpaceDetail) -> dict[str, Any]:
         "invite": (
             {"expires_at": detail.invite.expires_at}
             if detail.invite is not None
+            else None
+        ),
+        "share": (
+            {"url": detail.share.url, "created_at": detail.share.created_at}
+            if detail.share is not None
             else None
         ),
     }
@@ -342,6 +348,7 @@ class WebApi:
                 self._reset_invite,
                 "Reset invite",
             ),
+            ("spaces/<space_id>/share", "POST", self._set_share, "Change public link"),
             ("spaces/<space_id>/tasks", "GET", self._list_tasks, "List tasks"),
             ("spaces/<space_id>/tasks", "POST", self._create_task, "Create a task"),
             ("spaces/<space_id>/tasks/<seq>", "GET", self._get_task, "Task and log"),
@@ -400,6 +407,8 @@ class WebApi:
                 return error_response(str(exc), status_code=400)
             except NotFound as exc:
                 return error_response(str(exc), status_code=404)
+            except ShareConflict as exc:
+                return error_response(str(exc), status_code=409)
             except TodoError as exc:
                 return error_response(str(exc), status_code=400)
             except Exception:
@@ -432,6 +441,7 @@ class WebApi:
             "server_time": service.now(),
             "auto_archive_days": self._archive_days,
             "remind_before_minutes": self._remind_minutes,
+            "share_available": service.share_available,
             "limits": {
                 "title": MAX_TITLE_CHARS,
                 "description": MAX_DESCRIPTION_CHARS,
@@ -449,6 +459,15 @@ class WebApi:
         self, service: AdminService, body: dict, space_id: int
     ) -> dict[str, Any]:
         return _detail(service.get_space(space_id))
+
+    def _set_share(
+        self, service: AdminService, body: dict, space_id: int
+    ) -> dict[str, Any]:
+        """Validate a public-link action and return refreshed space details."""
+        action = body.get("action")
+        if not isinstance(action, str) or action not in {"on", "reset", "off"}:
+            raise InvalidInput("action 必须是 on、reset 或 off")
+        return _detail(service.set_share(_username(), space_id, action))
 
     def _rename(
         self, service: AdminService, body: dict, space_id: int

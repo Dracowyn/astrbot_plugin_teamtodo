@@ -50,6 +50,7 @@ from ..core.models import (
 from ..core.store import Store
 from . import task_ops
 from .access import is_invite_expired, new_invite
+from .share import ShareService
 from .todo_service import TaskListResult, TaskResult, TodoService
 
 MAX_EVENTS = 200
@@ -74,8 +75,16 @@ class SpaceSummary:
 
 
 @dcs.dataclass(frozen=True)
+class ShareDetail:
+    """A public link's display URL and creation time, without its raw token."""
+
+    url: str | None
+    created_at: float
+
+
+@dcs.dataclass(frozen=True)
 class SpaceDetail:
-    """A space with its bindings, members and invite state."""
+    """A space with its bindings, members, invite and public-link state."""
 
     summary: SpaceSummary
     bindings: list[tuple[Binding, str | None]]
@@ -84,6 +93,8 @@ class SpaceDetail:
     """Owner first, then admins, then members; each group by ``joined_at``."""
     invite: Invite | None
     """The active invite if any and not expired."""
+    share: ShareDetail | None = None
+    """The stored public link; its URL is absent when the base URL is invalid."""
 
 
 @dcs.dataclass(frozen=True)
@@ -111,7 +122,12 @@ class AdminService:
     """Space and task management for dashboard users."""
 
     def __init__(
-        self, store: Store, tz: tzinfo, *, clock: Callable[[], float] = time.time
+        self,
+        store: Store,
+        tz: tzinfo,
+        *,
+        clock: Callable[[], float] = time.time,
+        share_service: ShareService | None = None,
     ) -> None:
         """Create the service.
 
@@ -119,14 +135,21 @@ class AdminService:
             store: Open store.
             tz: Configured time zone.
             clock: Wall-clock Unix seconds.
+            share_service: Shared public-link rules, disabled by default.
         """
         self._store = store
         self.tz = tz
         self._clock = clock
+        self._shares = share_service or ShareService(store, tz, clock=clock)
 
     def now(self) -> float:
         """Current Unix time in seconds."""
         return self._clock()
+
+    @property
+    def share_available(self) -> bool:
+        """Whether configured public links can be enabled or reset."""
+        return self._shares.available
 
     # ----- spaces -----
 
@@ -149,12 +172,34 @@ class AdminService:
         invite = self._store.get_invite(space_id)
         if invite is not None and is_invite_expired(invite, now):
             invite = None
+        link = self._store.get_share(space_id)
         return SpaceDetail(
             self._summary(space, now),
             [(binding, titles.get(binding.session)) for binding in bindings],
             members,
             invite,
+            ShareDetail(self._shares.url(link), link.created_at)
+            if link is not None
+            else None,
         )
+
+    def set_share(self, username: str, space_id: int, action: str) -> SpaceDetail:
+        """Change a public link atomically and return refreshed space details.
+
+        Args:
+            username: Authenticated dashboard username for the operation log.
+            space_id: Space to enable, reset or disable sharing for.
+            action: One of ``on``, ``reset`` or ``off``.
+
+        Raises:
+            NotFound: The space does not exist.
+            ShareConflict: Sharing is unavailable or there is no link to reset.
+            TodoError: The action is invalid.
+        """
+        with self._store.transaction():
+            self._space(space_id)
+            self._shares.change(space_id, action, actor_label=username)
+            return self.get_space(space_id)
 
     def rename_space(self, username: str, space_id: int, name: str) -> Space:
         """Rename a space (same validation as ``/todo space rename``; the new

@@ -15,7 +15,7 @@ from astrbot_plugin_teamtodo.core.models import (
     TaskStatus,
     UserRef,
 )
-from astrbot_plugin_teamtodo.core.store import Store, _migrate_v1
+from astrbot_plugin_teamtodo.core.store import Store, _migrate_v1, _migrate_v2
 
 OWNER = UserRef(platform_id="adapter:one", user_id="owner:1")
 OTHER = UserRef(platform_id="adapter", user_id="one:owner:1")
@@ -78,6 +78,8 @@ WRITE_OPERATIONS = [
     lambda db, s, t: db.set_session_title("session", "Title"),
     lambda db, s, t: db.set_invite(s, "hash", 200),
     lambda db, s, t: db.clear_invite(s),
+    lambda db, s, t: db.set_share(s, "token"),
+    lambda db, s, t: db.clear_share(s),
 ]
 
 
@@ -753,3 +755,104 @@ def test_get_invite_by_space_returns_expired_and_replaced_invites(store):
     with db.transaction():
         db.clear_invite(first.id)
     assert db.get_invite(first.id) is None
+
+
+def test_share_replace_lookup_clear_and_space_cascade(store):
+    db, now = store
+    assert db.get_share(999) is None
+    assert db.find_share("missing") is None
+    with db.transaction():
+        a = db.create_space("a", OWNER)
+        b = db.create_space("b", OTHER)
+        first = db.set_share(a.id, "First_token")
+        other = db.set_share(b.id, "other")
+    assert db.get_share(a.id) == first
+    assert db.find_share("First_token") == first
+    assert db.find_share("first_token") is None
+    assert first.created_at == 100
+    now[0] = 200
+    with db.transaction():
+        second = db.set_share(a.id, "replacement")
+    assert second.created_at == 200
+    assert db.get_share(a.id) == second
+    assert db.find_share(first.token) is None
+    with pytest.raises(sqlite3.IntegrityError):
+        with db.transaction():
+            db.set_share(a.id, other.token)
+    assert db.get_share(a.id) == second
+    with pytest.raises(sqlite3.IntegrityError):
+        with db.transaction():
+            db.set_share(999, "no-space")
+    with pytest.raises(RuntimeError, match="rollback"):
+        with db.transaction():
+            db.clear_share(a.id)
+            raise RuntimeError("rollback")
+    assert db.find_share(second.token) == second
+    with db.transaction():
+        db.clear_share(a.id)
+        db.clear_share(a.id)
+        db.clear_share(999)
+        db.delete_space(b.id)
+    assert db.get_share(a.id) is None
+    assert db.find_share(second.token) is None
+    assert db.get_share(b.id) is None
+    assert db.find_share(other.token) is None
+
+
+def test_v2_upgrade_preserves_rows_and_persists_new_share_links(tmp_path):
+    path = tmp_path / "v2.sqlite3"
+    conn = sqlite3.connect(path)
+    _migrate_v1(conn)
+    _migrate_v2(conn)
+    conn.execute("PRAGMA user_version=2")
+    conn.execute("INSERT INTO spaces VALUES (1, 'legacy', 'adapter', 'owner', 10, 8)")
+    conn.execute("INSERT INTO bindings VALUES ('session', 1, 11)")
+    conn.execute("INSERT INTO session_defaults VALUES ('session', 1)")
+    conn.execute("INSERT INTO current_spaces VALUES ('session', 'adapter', 'owner', 1)")
+    conn.execute(
+        "INSERT INTO members VALUES (1, 'adapter', 'owner', '昵称', 'owner', 12)"
+    )
+    conn.execute(
+        "INSERT INTO tasks VALUES (1, 1, 7, '任务', 'todo', 100, 'high', '描述', 'adapter', 'owner', 'session', 12, 13, NULL, 0)"
+    )
+    conn.execute("INSERT INTO task_assignees VALUES (1, 0, 'adapter', 'owner')")
+    conn.execute("INSERT INTO task_tags VALUES (1, 0, '标签')")
+    conn.execute(
+        "INSERT INTO events VALUES (1, 1, 7, 'create', '{}', 'adapter', 'owner', '', 'session', 12)"
+    )
+    conn.execute("INSERT INTO invites VALUES (1, 'hash', 500)")
+    conn.execute("INSERT INTO session_titles VALUES ('session', '群名', 14)")
+    conn.execute(
+        "INSERT INTO space_events VALUES (1, 1, 'claim', '{}', NULL, NULL, 'admin', '', 15)"
+    )
+    tables = [
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    ]
+    original = {
+        table: conn.execute(f'SELECT * FROM "{table}"').fetchall() for table in tables
+    }
+    conn.commit()
+    conn.close()
+    db = Store(path, clock=lambda: 20)
+    try:
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        for table, rows in original.items():
+            assert [
+                tuple(row) for row in db._conn.execute(f'SELECT * FROM "{table}"')
+            ] == rows
+        assert db.get_share(1) is None
+        with db.transaction():
+            link = db.set_share(1, "migrated-token")
+            task = db.create_task(draft(1))
+        assert task.seq == 8
+        assert db.list_tasks(1, ALL)[0].title == "任务"
+    finally:
+        db.close()
+    db = Store(path)
+    try:
+        assert db.get_share(1) == link
+        assert db.find_share(link.token) == link
+        assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        db.close()
