@@ -17,7 +17,7 @@ import dataclasses as dcs
 import itertools
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, tzinfo
 
 from ..core import permissions as perms
@@ -25,6 +25,7 @@ from ..core.models import (
     MAX_SPACE_NAME_CHARS,
     Actor,
     EventAction,
+    GroupMember,
     Invite,
     Member,
     Mention,
@@ -756,22 +757,7 @@ class TodoService:
         Raises:
             TodoError: The actor may not manage admins of the current space.
         """
-        bound = [b.space_id for b in self._store.list_bindings(actor.session)]
-        first = (
-            self._store.get_current(actor.session, actor.user),
-            self._store.get_session_default(actor.session),
-        )
-        space_id = next((i for i in (*first, *bound) if i in bound), None)
-        if space_id is None:  # A new auto space would be owned as below.
-            allowed = actor.is_bot_admin or actor.is_private or actor.is_session_admin
-            perms.require(allowed, perms.Op.MANAGE_ADMINS)
-            return set(users)
-        member = self._store.get_member(space_id, actor.user)
-        space = self._store.get_space(space_id)
-        perms.require(
-            perms.can_manage_admins(actor, member, space), perms.Op.MANAGE_ADMINS
-        )
-        return {u for u in users if self._store.get_member(space_id, u) is None}
+        return task_ops.admin_precheck(self._store, actor, users)
 
     def set_admins(
         self,
@@ -797,3 +783,16 @@ class TodoService:
             return space, task_ops.set_roles(
                 self._store, space, ops, actor, raw, verified or {}, id_label
             )
+
+    def sync_precheck(self, actor: Actor, name: str | None = None) -> Space:
+        """Check sync permission read-only, without creating a target space."""
+        return task_ops.sync_precheck(self._store, actor, name)
+
+    def sync_members(
+        self, actor: Actor, members: Sequence[GroupMember], name: str | None = None
+    ) -> tuple[Space, int, int]:
+        """Re-resolve and recheck the target, then sync and log atomically."""
+        with self._store.transaction():
+            space = self.sync_precheck(actor, name)
+            added, total = task_ops.sync_members(self._store, space, actor, members)
+            return space, added, total

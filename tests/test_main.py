@@ -906,7 +906,7 @@ async def test_terminate_closes_store(plugin):
 # ----- M2: tools, assignment replies, reminders -----------------------------
 
 
-def test_registers_the_six_llm_tools(plugin):
+def test_registers_the_seven_llm_tools(plugin):
     # Act
     names = [tool.name for tool in plugin.context.tools]
 
@@ -918,6 +918,7 @@ def test_registers_the_six_llm_tools(plugin):
         "teamtodo_update_task",
         "teamtodo_list_spaces",
         "teamtodo_use_space",
+        "teamtodo_sync_members",
     ]
 
 

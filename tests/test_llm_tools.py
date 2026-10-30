@@ -9,6 +9,8 @@ from astrbot_plugin_teamtodo.core.models import (
     Actor,
     GroupMember,
     Mention,
+    SpaceEventAction,
+    SpaceRole,
     TaskStatus,
     UserRef,
 )
@@ -178,7 +180,7 @@ async def seed_space(tools, store, *members):
 # ----- registration and call guards -----------------------------------------
 
 
-def test_build_returns_the_six_tools_with_write_flags(tools):
+def test_build_returns_tools_with_write_flags(tools):
     # Act
     flags = {name: tool.writes for name, tool in tools.items()}
 
@@ -190,6 +192,7 @@ def test_build_returns_the_six_tools_with_write_flags(tools):
         "teamtodo_update_task": True,
         "teamtodo_list_spaces": False,
         "teamtodo_use_space": True,
+        "teamtodo_sync_members": True,
     }
     assert all(tool.__module__ == llm_tools.__name__ for tool in tools.values())
 
@@ -595,12 +598,10 @@ async def test_group_aliases_and_duplicate_rows_deduplicate_by_user(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("private", [True, False])
-async def test_group_lookup_never_runs_for_private_or_explicit_space(
-    tools, group_lookup, private
-):
-    await call(tools, "teamtodo_list_tasks", FakeEvent(private=private))
-    event = FakeEvent(private=private)
+@pytest.mark.parametrize("space", [None, "我的任务"])
+async def test_group_lookup_never_runs_for_private_chat(tools, group_lookup, space):
+    await call(tools, "teamtodo_list_tasks", FakeEvent(private=True))
+    event = FakeEvent(private=True)
     group_lookup["members"] = [GroupMember(user("g1"), "Bob", ("Bob",))]
 
     out = await call(
@@ -609,10 +610,54 @@ async def test_group_lookup_never_runs_for_private_or_explicit_space(
         event,
         title="x",
         assignees=["Bob"],
-        **({} if private else {"space": SPACE}),
+        space=space,
     )
 
     assert out == "Error: 空间成员里没有「Bob」，请让用户 @ 对方"
+    assert group_lookup["calls"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("space_name", [SPACE, "Ops"])
+async def test_group_lookup_for_explicit_bound_space(
+    tools, store, group_lookup, space_name
+):
+    current = await seed_space(tools, store)
+    with store.transaction():
+        other = store.create_space("Ops", None)
+        store.bind(GROUP, other.id)
+        store.upsert_member(other.id, user("known-id"), "Known")
+        store.upsert_member(current.id, user("known-id"), "Known")
+    event = FakeEvent()
+    group_lookup["members"] = [
+        GroupMember(user("new-id"), "Card", ("Account",)),
+        GroupMember(user("impostor-id"), "Known", ("Known",)),
+    ]
+
+    out = await call(
+        tools,
+        "teamtodo_add_task",
+        event,
+        title="x",
+        assignees=["Known", "Account"],
+        space=space_name,
+    )
+
+    target = current if space_name == SPACE else other
+    untouched = other if space_name == SPACE else current
+    assert data_of(out)["assignees"] == ["Known", "Card"]
+    assert store.get_task(target.id, 1).assignees == (user("known-id"), user("new-id"))
+    assert store.get_member(untouched.id, user("new-id")) is None
+    assert group_lookup["calls"] == [event]
+
+
+@pytest.mark.asyncio
+async def test_group_lookup_rejects_unbound_space_before_fetch(tools, group_lookup):
+    out = await call(
+        tools, "teamtodo_add_task", title="x", assignees=["Bob"], space="Nope"
+    )
+
+    assert out == "Error: 本会话没有绑定名为「Nope」的空间"
     assert group_lookup["calls"] == []
 
 
@@ -1045,3 +1090,191 @@ async def test_session_title_failure_does_not_break_the_tool(
     # Assert
     assert not result.startswith("Error")
     assert len(errors) == 1
+
+
+# ----- group member sync ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["owner", "admin", "bot_admin"])
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_sync_members_preserves_roles_and_logs_chat_actor(
+    tools, store, group_lookup, monkeypatch, role, explicit
+):
+    space = await seed_space(
+        tools, store, ("admin-id", "Old admin"), ("absent-id", "Absent")
+    )
+    with store.transaction():
+        store.set_space_owner(space.id, user("u1"))
+        store.set_member_role(space.id, user("admin-id"), SpaceRole.ADMIN)
+    sender = {"owner": "u1", "admin": "admin-id", "bot_admin": "bot-admin-id"}[role]
+    monkeypatch.setattr(FakeEvent, "is_admin", lambda self: role == "bot_admin")
+    event = FakeEvent(sender=sender)
+    group_lookup["members"] = [
+        GroupMember(user("u1"), "New owner", ("New owner",)),
+        GroupMember(user("admin-id"), "New admin", ("New admin",)),
+        GroupMember(user("new-member-id"), "New member", ("New member",)),
+        GroupMember(user("new-member-id"), "New member", ("New member",)),
+        GroupMember(UserRef("other-platform", "foreign-id"), "Foreign", ("Foreign",)),
+    ]
+
+    out = await call(
+        tools, "teamtodo_sync_members", event, **({"space": SPACE} if explicit else {})
+    )
+
+    assert data_of(out) == {"space": SPACE, "added": 1, "total": 4}
+    saved = {m.user: (m.nickname, m.role) for m in store.list_members(space.id)}
+    assert saved == {
+        user("u1"): ("New owner", SpaceRole.OWNER),
+        user("admin-id"): ("New admin", SpaceRole.ADMIN),
+        user("absent-id"): ("Absent", SpaceRole.MEMBER),
+        user("new-member-id"): ("New member", SpaceRole.MEMBER),
+    }
+    events = [
+        e
+        for e in store.list_space_events(space.id)
+        if e.action == SpaceEventAction.SYNC
+    ]
+    assert len(events) == 1
+    assert events[0].detail == {"session": GROUP, "added": 1}
+    assert events[0].actor == user(sender)
+    assert events[0].actor_label == ""
+    assert events[0].session == GROUP
+    assert group_lookup["calls"] == [event]
+    assert all(
+        uid not in out
+        for uid in ("u1", "admin-id", "absent-id", "new-member-id", "foreign-id")
+    )
+
+    again = await call(tools, "teamtodo_sync_members", event)
+    assert data_of(again) == {"space": SPACE, "added": 0, "total": 4}
+    assert (
+        len(
+            [
+                e
+                for e in store.list_space_events(space.id)
+                if e.action == SpaceEventAction.SYNC
+            ]
+        )
+        == 2
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bound,bot_admin", [(False, False), (True, False), (False, True)]
+)
+async def test_sync_denied_readonly_without_fetch(
+    tools, store, group_lookup, monkeypatch, bound, bot_admin
+):
+    monkeypatch.setattr(FakeEvent, "is_admin", lambda self: bot_admin)
+    if bound:
+        space = await seed_space(tools, store)
+    before = store.list_spaces()
+
+    def no_transaction():
+        pytest.fail("Denied sync must not open a transaction")
+
+    monkeypatch.setattr(store, "transaction", no_transaction)
+    out = await call(tools, "teamtodo_sync_members", FakeEvent(sender="outsider-id"))
+
+    assert out == "Error: 只有空间管理员可以执行这个操作"
+    assert group_lookup["calls"] == []
+    assert store.list_spaces() == before
+    if bound:
+        assert store.get_member(space.id, user("outsider-id")) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("members", [None, []])
+async def test_sync_unavailable_members_leave_space_unchanged(
+    tools, store, group_lookup, members
+):
+    space = await seed_space(tools, store)
+    with store.transaction():
+        store.set_space_owner(space.id, user("u1"))
+    before = store.list_members(space.id), store.list_space_events(space.id)
+    group_lookup["members"] = members
+    event = FakeEvent()
+
+    out = await call(tools, "teamtodo_sync_members", event)
+
+    assert out == "Error: 当前平台无法获取群成员列表"
+    assert group_lookup["calls"] == [event]
+    assert (store.list_members(space.id), store.list_space_events(space.id)) == before
+
+
+@pytest.mark.asyncio
+async def test_sync_private_chat_refused_without_fetch(tools, store, group_lookup):
+    event = FakeEvent(private=True)
+    await call(tools, "teamtodo_list_tasks", event)
+
+    out = await call(tools, "teamtodo_sync_members", event)
+
+    assert out == "Error: 只能在群聊里同步群成员"
+    assert group_lookup["calls"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard", ["disabled", "cron", "not_addressed", "unbound"])
+async def test_sync_call_guards_precede_fetch(tools, enabled, group_lookup, guard):
+    event = FakeEvent()
+    kwargs = {}
+    if guard == "disabled":
+        enabled["value"] = False
+        expected = "Error: the TeamTodo plugin is disabled in this chat."
+    elif guard == "cron":
+        event.platform = "cron"
+        expected = "Error: TeamTodo tools are not available in scheduled tasks."
+    elif guard == "not_addressed":
+        event.is_at_or_wake_command = False
+        expected = llm_tools.NOT_ADDRESSED
+    else:
+        kwargs["space"] = "Nope"
+        expected = "Error: 本会话没有绑定名为「Nope」的空间"
+
+    out = await call(tools, "teamtodo_sync_members", event, **kwargs)
+
+    assert out == expected
+    assert group_lookup["calls"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["revoke", "unbind", "switch"])
+async def test_sync_rechecks_target_after_fetch(tools, store, monkeypatch, change):
+    space = await seed_space(tools, store)
+    with store.transaction():
+        store.set_space_owner(space.id, user("owner-id"))
+        store.set_member_role(space.id, user("u1"), SpaceRole.ADMIN)
+        other = store.create_space("Other", user("owner-id"))
+        store.bind(GROUP, other.id)
+
+    async def fetch(event):
+        with store.transaction():
+            if change == "revoke":
+                store.set_member_role(space.id, user("u1"), SpaceRole.MEMBER)
+            elif change == "unbind":
+                store.unbind(GROUP, space.id)
+            else:
+                store.set_current(GROUP, user("u1"), other.id)
+        return [GroupMember(user("new-id"), "New", ("New",))]
+
+    monkeypatch.setattr(llm_tools.group_members, "from_event", fetch)
+    out = await call(
+        tools,
+        "teamtodo_sync_members",
+        **({"space": SPACE} if change == "unbind" else {}),
+    )
+
+    expected = (
+        f"Error: 本会话没有绑定名为「{SPACE}」的空间"
+        if change == "unbind"
+        else "Error: 只有空间管理员可以执行这个操作"
+    )
+    assert out == expected
+    for target in (space, other):
+        assert store.get_member(target.id, user("new-id")) is None
+        assert all(
+            e.action != SpaceEventAction.SYNC
+            for e in store.list_space_events(target.id)
+        )

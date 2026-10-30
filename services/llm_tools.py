@@ -108,7 +108,7 @@ _NAMES = {
     "description": (
         "Display names. People @-mentioned in the current message match by "
         "their @ name; otherwise the exact nickname of a space member. In "
-        "group chats with space omitted, group member names are also matched. "
+        "group chats, group member names are also matched for any space bound here. "
         "Never guess: if the tool reports no or several matches, ask the user "
         "to @ the person."
     ),
@@ -173,6 +173,7 @@ UPDATE_TASK_SCHEMA = {
     "required": ["number"],
 }
 LIST_SPACES_SCHEMA = {"type": "object", "properties": {}}
+SYNC_MEMBERS_SCHEMA = {"type": "object", "properties": {"space": _SPACE}}
 USE_SPACE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -322,7 +323,7 @@ class TeamTodoToolkit:
         self._resolver = resolver
 
     def build(self) -> list[TeamTodoTool]:
-        """Return the six tools of design 5."""
+        """Return the tools of design 5."""
         specs = [
             (
                 "teamtodo_add_task",
@@ -368,6 +369,16 @@ class TeamTodoToolkit:
                 USE_SPACE_SCHEMA,
                 True,
                 self.use_space,
+            ),
+            (
+                "teamtodo_sync_members",
+                "Register every member of the current group chat as a space member "
+                "so they can be assigned by name. Use when a name cannot be found "
+                "in a group chat, then retry the assignment. Only space admins, "
+                "the owner or AstrBot admins may use this. QQ group chats only.",
+                SYNC_MEMBERS_SCHEMA,
+                True,
+                self.sync_members,
             ),
         ]
         return [
@@ -423,9 +434,9 @@ class TeamTodoToolkit:
     ) -> tuple[Mention, ...]:
         """Resolve names by mention, space member, then current group member.
 
-        Matching ignores case and leading ``@``. Group lookup is lazy and
-        only applies with no explicit space; callers share ``group_cache``
-        across resolutions in a single tool call.
+        Matching ignores case and leading ``@``. Group lookup is lazy for any
+        space bound to this group; callers share ``group_cache`` across
+        resolutions in a single tool call.
 
         Raises:
             TodoError: A name is empty, matches nobody, or matches several.
@@ -446,7 +457,7 @@ class TeamTodoToolkit:
                     m.user.key: Mention(user=m.user, name=m.nickname)
                     for m in service.find_members(actor, auto_name, name, space)
                 }
-            if not hits and not space and event.get_group_id():
+            if not hits and event.get_group_id():
                 if "members" not in group_cache:
                     group_cache["members"] = await group_members.from_event(event)
                 hits = {
@@ -674,5 +685,23 @@ class TeamTodoToolkit:
         return _wrap(
             "Switched the speaker's current space.",
             {"space": chosen.name},
+            service.local_now(),
+        )
+
+    async def sync_members(
+        self, event: AstrMessageEvent, space: str | None = None
+    ) -> str:
+        """Implement ``teamtodo_sync_members`` with pre- and post-fetch checks."""
+        service, actor, _ = await self._context(event)
+        service.sync_precheck(actor, space)
+        if not event.get_group_id():
+            raise TodoError("只能在群聊里同步群成员")
+        members = await group_members.from_event(event)
+        if not members:
+            raise TodoError("当前平台无法获取群成员列表")
+        chosen, added, total = service.sync_members(actor, members, space)
+        return _wrap(
+            f"Synced group members: {added} added, {total} total.",
+            {"space": chosen.name, "added": added, "total": total},
             service.local_now(),
         )

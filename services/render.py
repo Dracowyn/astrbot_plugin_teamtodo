@@ -250,7 +250,7 @@ def event_summary(
                 and not isinstance(added, bool)
                 and added >= 0
             ):
-                return f"从「{session}」同步群成员，新增 {added} 人"
+                return f"同步群成员：{session}，新增 {added} 人"
         elif event.action == SpaceEventAction.CLAIM:
             return "认领空间"
         elif event.action == SpaceEventAction.ROLE:

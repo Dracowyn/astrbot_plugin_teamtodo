@@ -1,16 +1,17 @@
 """Shared task limits, lifecycle transitions and transactional operation logs.
 
-Also holds the chat-side space role update (``set_roles``). Callers resolve
-identities, permissions and patch syntax before invoking these helpers inside
-their store transaction. Chat and WebUI writes share all rules; log identity
-is always explicit and independent of the task creator.
+Also holds chat-side space role updates and member synchronization. Callers
+resolve identities, permissions and patch syntax before invoking write helpers
+inside their store transaction. Log identity is explicit and independent of
+the task creator; prechecks are read-only.
 """
 
 from __future__ import annotations
 
 import dataclasses as dcs
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
+from ..core import permissions as perms
 from ..core.models import (
     MAX_ASSIGNEES,
     MAX_DESCRIPTION_CHARS,
@@ -19,6 +20,7 @@ from ..core.models import (
     MAX_TITLE_CHARS,
     Actor,
     EventAction,
+    GroupMember,
     Member,
     Mention,
     Space,
@@ -206,3 +208,77 @@ def set_roles(
                 )
             )
     return changed
+
+
+def _bound_target(store: Store, actor: Actor, name: str | None = None) -> Space | None:
+    """Resolve a bound target without creating a space or updating defaults."""
+    if name:
+        space_id = store.session_space_names(actor.session).get(name)
+        if space_id is None:
+            raise TodoError(f"本会话没有绑定名为「{name}」的空间")
+    else:
+        bound = [b.space_id for b in store.list_bindings(actor.session)]
+        first = (
+            store.get_current(actor.session, actor.user),
+            store.get_session_default(actor.session),
+        )
+        space_id = next((i for i in (*first, *bound) if i in bound), None)
+    return store.get_space(space_id) if space_id is not None else None
+
+
+def admin_precheck(
+    store: Store, actor: Actor, users: frozenset[UserRef]
+) -> set[UserRef]:
+    """Check owner permission read-only and return unknown target identities."""
+    space = _bound_target(store, actor)
+    if space is None:
+        allowed = actor.is_bot_admin or actor.is_private or actor.is_session_admin
+        perms.require(allowed, perms.Op.MANAGE_ADMINS)
+        return set(users)
+    member = store.get_member(space.id, actor.user)
+    perms.require(perms.can_manage_admins(actor, member, space), perms.Op.MANAGE_ADMINS)
+    return {u for u in users if store.get_member(space.id, u) is None}
+
+
+def sync_precheck(store: Store, actor: Actor, name: str | None = None) -> Space:
+    """Resolve an existing bound space and check management permission read-only.
+
+    Raises:
+        TodoError: Unbound name, no existing space, or denied permission.
+    """
+    space = _bound_target(store, actor, name)
+    if space is None:
+        raise TodoError(perms.DENIAL_MESSAGES[perms.Op.MANAGE_SPACE])
+    member = store.get_member(space.id, actor.user)
+    perms.require(perms.can_manage_space(actor, member, space), perms.Op.MANAGE_SPACE)
+    return space
+
+
+def sync_members(
+    store: Store, space: Space, actor: Actor, members: Sequence[GroupMember]
+) -> tuple[int, int]:
+    """Upsert same-platform members and log one chat sync in the open transaction.
+
+    Existing roles and absent members are kept. Permission and binding must
+    have been rechecked by the caller inside this transaction.
+
+    Returns:
+        The added count and total space member count.
+    """
+    added = 0
+    for member in members:
+        if member.user.platform_id != actor.user.platform_id:
+            continue
+        if store.get_member(space.id, member.user) is None:
+            added += 1
+        store.upsert_member(space.id, member.user, member.nickname)
+    store.add_space_event(
+        SpaceEventDraft(
+            space_id=space.id,
+            action=SpaceEventAction.SYNC,
+            detail={"session": actor.session, "added": added},
+            actor=actor.user,
+            session=actor.session,
+        )
+    )
+    return added, len(store.list_members(space.id))

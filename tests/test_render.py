@@ -487,13 +487,31 @@ def test_space_event_summary_actions(action, detail, expected):
 @pytest.mark.parametrize(
     "session", ["qq-main:GroupMessage:123", "qq-main:GroupMessage:room:123"]
 )
-def test_space_sync_summary_preserves_session_convention(added, session):
+@pytest.mark.parametrize(
+    "actor,actor_label,expected_actor",
+    [(ALICE, "", "张三"), (None, "WebUI 管理员", "WebUI 管理员")],
+)
+def test_space_sync_log_preserves_session_count_and_actor(
+    added, session, actor, actor_label, expected_actor
+):
     event = make_event(
-        SpaceEventAction.SYNC, {"session": session, "added": added}, space=True
+        SpaceEventAction.SYNC,
+        {"session": session, "added": added},
+        space=True,
+        actor=actor,
+        actor_label=actor_label,
+        session=session if actor is not None else None,
     )
-    assert event_summary(event, {}, UTC) == (
-        f"从「{session}」同步群成员，新增 {added} 人"
+    summary = event_summary(event, {}, UTC)
+    bind_summary = event_summary(
+        make_event(SpaceEventAction.BIND, {"session": session}, space=True),
+        {},
+        UTC,
     )
+    assert bind_summary[bind_summary.index("：") :] in summary
+    assert str(added) in summary.replace(session, "")
+    assert "同步" in summary
+    assert event_actor_name(event, {ALICE.key: "张三"}) == expected_actor
 
 
 @pytest.mark.parametrize(
