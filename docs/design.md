@@ -1,6 +1,6 @@
 # astrbot_plugin_teamtodo 设计
 
-> 状态：设计已确认（2026-10-30），经过一轮 review，R1–R13 均已落实。M1 已实现；M2 的细化决定见第 5、6 节的“M2 定稿”。
+> 状态：设计已确认（2026-10-30），经过一轮 review，R1–R13 均已落实。M1–M3.2 已实现；各里程碑的细化决定见对应章节的“定稿”，M4 见第 8 节。
 > 本文记录需求讨论中定下的全部决策。实现时如需偏离，先改这份文档再改代码。
 
 ## 1. 定位
@@ -146,7 +146,7 @@
 | `leave <空间名>` | 把本会话从该空间解绑 | 会话管理员 |
 | `claim` | 认领本会话绑定的无主空间（当前空间）；只能在群聊里执行，防止有人用邀请码把无主空间拉进自己的私聊后再认领 | 会话管理员 |
 | `admin +@x` / `admin -@x` / `admin +123456` / `admin -123456` | 任命或撤销当前空间的管理员，可混用，一次最多 20 个对象（`MAX_ASSIGNEES`）；用户 ID 须为带正负号的 5–20 位 ASCII 数字（支持全角正负号，符号后可有空白）。先只读检查权限，非所有者一律得到同一句拒绝，不查成员、不拉群列表（拒绝优先于用法错误）。已有成员直接操作；新增 ID 不是成员时，须在本群成员列表中查到才登记（昵称取群名片），私聊或无法列出群成员时不登记，报“找不到 QQ 号 / 用户 ID …”（aiocqhttp 叫 QQ 号，其他平台叫用户 ID）；是否成员在改角色的同一事务里判定，以实际修改的空间为准；撤销非成员报错；任一对象出错则整条命令不生效。回复优先显示昵称，无昵称显示 ID | 所有者 |
-| `share on` / `off` / `reset` | 开启、关闭公开链接，或重置 token（M4） | 空间管理员 |
+| `share` / `share on` / `off` / `reset` | 查看、开启、关闭公开链接，或重置 token（M4，规则见第 8 节“M4 定稿”） | 空间管理员 |
 
 上表的“空间管理员”同时包含所有者；AstrBot 管理员在所有空间都拥有全部权限。“成员”就是任何在绑定会话里用过 todo 的人，第一次使用时自动加入。
 
@@ -262,7 +262,7 @@
 - 模块：
   - `services/admin_service.py`：WebUI 的业务操作。调用者都是 AstrBot 管理员，不做空间级权限检查，但长度上限和状态规则与聊天入口共用同一套代码。
   - `services/web_api.py`：路由、参数校验、序列化。路由注册为 `/astrbot_plugin_teamtodo/<path>`。
-- 分享链接（`share`）属于 M4，M3 不注册这个接口，页面隐藏分享区域。
+- 分享链接（`share`）属于 M4，M3 不注册这个接口，页面隐藏分享区域。M4 的接口和字段见第 8 节“M4 定稿”。
 - 删除空间在 WebUI 里不用确认码，由页面弹窗二次确认。
 
 **HTTP 接口**（前端用 `window.AstrBotPluginView.apiGet/apiPost` 调用；时间都是 Unix 秒；出错时用 `error_response(中文文案, status_code)` 返回：参数不对 400、空间或任务不存在 404、业务冲突 409，其余由 `TodoError` 转为 400）：
@@ -329,6 +329,36 @@
 - 插件 `terminate()` 时必须关闭这个 HTTP 服务，否则热重载时端口会被占用。
 - Docker 部署要在 compose 里多映射一个端口，README 写明。
 
+**M4 定稿**（2026-10-31）：
+
+- 存储：迁移 3 新增 `share_links(space_id PK → spaces ON DELETE CASCADE, token UNIQUE, created_at)`，每个空间最多一条，有这一行就表示已分享，关闭分享即删除这一行。token 明文存储，管理员可以随时再次复制链接；数据库本来就存着链接能看到的全部任务，哈希存储换不来额外的保护。模型 `ShareLink`，存储方法 `set_share` / `get_share` / `find_share` / `clear_share`。
+- token：`secrets.token_urlsafe(24)`（192 位，32 个字符）。重置生成新 token，旧链接立即失效。
+- 链接：`<对外访问地址>/b/<token>/`，结尾带斜杠，页面里的相对路径资源才能解析。对外访问地址去掉首尾空白和结尾的 `/`；不以 `http://` 或 `https://` 开头时视为未填写，并记 warning。
+- 分享可用 = 配置里开启了公开服务，且对外访问地址有效。只看配置，不看端口是否绑定成功（绑定失败记 error 日志）。
+- 聊天命令（全部要求空间管理员，与邀请码相同，`perms.can_manage_space`；作用于当前空间）：
+  - `share`：已分享时回复链接，否则回复“当前空间没有开启公开链接”。
+  - `share on`：分享不可用时报错“公开看板服务未开启或未配置对外访问地址，请联系 AstrBot 管理员”；已有链接时直接回复原链接，不换 token、不记日志；否则生成 token 并回复链接。
+  - `share reset`：分享不可用时报同样的错；没有链接时报“当前空间还没有公开链接，用 /todo share on 开启”；否则换新 token 并回复新链接。
+  - `share off`：删除链接（分享不可用时也能关）；没有链接时回复“当前空间没有开启公开链接”，不报错。
+  - 实际发生变化时记空间日志 `SHARE {"op": "on"|"reset"|"off"}`，日志里不写 token。权限判断和写入在同一个事务里。
+- LLM 不提供分享工具（第 5 节）。
+- 公开数据（`GET /b/<token>/api/board`）只输出白名单字段：
+
+  ```
+  {space: {name}, tasks: PublicTask[], updated_at, server_time, timezone}
+  PublicTask = {seq, title, status, assignees: [{nickname}], due_at, tags, priority, description, done_at, updated_at, overdue}
+  ```
+
+  任务只含待办、进行中、已完成，排序与管理页 `list_tasks` 相同。负责人昵称取空间成员表，查不到时显示“未知成员”，绝不回退到用户 ID。`updated_at` 取空间创建时间和所有可见任务 `updated_at` 的最大值。不含创建人、空间 ID、会话、日志、成员列表。
+- 服务（`services/public_server.py`，aiohttp `AppRunner` + `TCPSite`，关闭自带访问日志）：
+  - 路由只有 `GET`/`HEAD`：`/b/<token>` 相对重定向到 `<token>/`；`/b/<token>/` 返回 `public.html`；`/b/<token>/api/board` 返回数据；`/b/<token>/<路径>` 返回 `views/board` 下的 `.js` / `.css` 静态文件；其余一律 404。
+  - 页面和静态文件不查 token：任何 token 都拿到同一个页面，链接是否有效只由数据接口回答，页面本身不能用来探测 token。数据接口对未知、已关闭、空间已删除的 token 返回同一个 404。
+  - 限流只统计数据接口，按客户端 IP，默认每分钟 60 次（页面 30 秒刷新一次），超出返回 429。开启“信任反向代理”后取 `X-Forwarded-For` 最右边的一项（最近一层代理看到的地址），解析不出合法 IP 时退回连接对端地址。
+  - 所有响应带 `Referrer-Policy: no-referrer`、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`；页面另带 CSP 和禁止被嵌入框架的头。日志里不出现 token。
+  - 插件 `initialize` 时按配置启动，启动失败只记日志，插件其余功能照常；`terminate` 时先停服务再关数据库。数据回调每次请求现取服务，取不到时按 404 处理。
+- WebUI：`meta` 增加 `share_available`；`SpaceDetail` 增加 `share: {url: string|null, created_at}|null`（对外访问地址无效时 `url` 为 null）；新接口 `POST spaces/<space_id>/share`，入参 `{action: "on"|"reset"|"off"}`，返回 `SpaceDetail`，规则与聊天命令相同，不可用或无链接可重置时返回 409，日志操作人记 WebUI 用户名。
+- 公开页（`views/board/public.html` + `public-app.js`）：在 `/b/<token>/` 下用相对地址 `api/board` 取数据（`credentials: "omit"`），404 显示“链接无效或已关闭”并停止轮询，429 和网络错误按暂时失败处理。用本地静态服务器打开演示时（路径里没有 `/b/`）继续用 mock 数据，mock 模块按需动态加载，生产页面不加载。
+
 ## 9. 前端
 
 - 不需要构建：使用原生 ES Modules，Vue 3（`vue.esm-browser.prod.js`）和 SortableJS 以单文件形式放在 `static/vendor/`。
@@ -367,6 +397,8 @@
 | `services/admin_service.py`（M3） | WebUI 管理操作（调用者都是 AstrBot 管理员） |
 | `services/web_api.py`（M3） | WebUI 接口：路由、参数校验、序列化 |
 | `services/group_members.py`（M3.1） | 从平台拉群成员列表（聊天事件或会话串两种入口） |
+| `services/share.py`（M4） | 分享 token 生成、链接拼接、开关重置的事务规则（聊天与 WebUI 共用）、公开数据白名单序列化 |
+| `services/public_server.py`（M4） | 公开看板 HTTP 服务：路由、静态文件、限流、响应头 |
 
 **验证口径**：
 - 在插件目录下，用 AstrBot 的 `.venv` 运行：`..\..\..\.venv\Scripts\python.exe -m pytest -q --cov=astrbot_plugin_teamtodo --cov-report=term-missing tests`。`core/` 和 `services/` 每个模块的行覆盖率都要 ≥ 80%。
@@ -380,11 +412,14 @@
 | 时区 | `Asia/Shanghai` |
 | 到期提醒提前量（分钟） | 60（0 表示到点才提醒） |
 | 完成后自动归档天数 | 7（0 表示关闭） |
-| 公开服务开关 | 关闭 |
-| 公开服务监听地址 | `127.0.0.1` |
-| 公开服务端口 | M4 中确定 |
-| 对外 base URL | 空（不填就不生成分享链接） |
-| 公开服务限流阈值 | M4 中确定 |
+| 公开服务开关（`public_enabled`） | 关闭 |
+| 公开服务监听地址（`public_host`） | `127.0.0.1` |
+| 公开服务端口（`public_port`） | 6200（AstrBot 自带适配器占用 6185、6194–6199） |
+| 对外访问地址（`public_base_url`） | 空（不填就不生成分享链接） |
+| 公开服务限流（`public_rate_limit`，每 IP 每分钟数据请求数） | 60；小于 1 时按 60 |
+| 信任反向代理（`public_trust_proxy`） | 关闭 |
+
+公开服务的配置在插件加载时读取，修改后需重载插件。端口不在 1–65535 时记 warning 并按 6200。
 
 ## 11. 存储
 

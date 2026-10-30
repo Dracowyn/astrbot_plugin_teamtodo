@@ -4,7 +4,8 @@ CONTRACT (owned by the main loop; implementers fill in the bodies, signatures
 and documented behaviour are fixed):
 
 - One ``sqlite3`` connection per ``Store``, WAL mode, ``foreign_keys=ON``,
-  schema versioned with ``PRAGMA user_version`` (M1 = version 1, M3 = version 2).
+  schema versioned with ``PRAGMA user_version`` (M1 = version 1, M3 = version 2,
+  M4 = version 3).
   Later milestones add tables through numbered migrations, never by editing v1.
 - Every mutating method must run inside ``with store.transaction():`` and
   raises ``RuntimeError`` otherwise. ``transaction()`` issues
@@ -32,6 +33,7 @@ from .models import (
     Invite,
     Member,
     Priority,
+    ShareLink,
     Space,
     SpaceEvent,
     SpaceEventAction,
@@ -171,7 +173,18 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
-_MIGRATIONS = (_migrate_v1, _migrate_v2)
+def _migrate_v3(conn: sqlite3.Connection) -> None:
+    """M4: one public board link per space, removed with the space."""
+    conn.execute(
+        """CREATE TABLE share_links (
+            space_id INTEGER PRIMARY KEY REFERENCES spaces(id) ON DELETE CASCADE,
+            token TEXT NOT NULL UNIQUE,
+            created_at REAL NOT NULL
+        )"""
+    )
+
+
+_MIGRATIONS = (_migrate_v1, _migrate_v2, _migrate_v3)
 
 
 class Store:
@@ -764,6 +777,39 @@ class Store:
         """Remove the space's invite if any."""
         self._require_transaction()
         self._conn.execute("DELETE FROM invites WHERE space_id=?", (space_id,))
+
+    # ----- share links (M4) -----
+
+    def set_share(self, space_id: int, token: str) -> ShareLink:
+        """Create or replace the space's public link; ``created_at`` is now."""
+        self._require_transaction()
+        created_at = self._clock()
+        self._conn.execute(
+            """INSERT INTO share_links VALUES (?, ?, ?)
+               ON CONFLICT(space_id) DO UPDATE
+               SET token=excluded.token, created_at=excluded.created_at""",
+            (space_id, token, created_at),
+        )
+        return ShareLink(space_id=space_id, token=token, created_at=created_at)
+
+    def get_share(self, space_id: int) -> ShareLink | None:
+        """The space's public link, if sharing is on."""
+        row = self._conn.execute(
+            "SELECT * FROM share_links WHERE space_id=?", (space_id,)
+        ).fetchone()
+        return ShareLink(**row) if row is not None else None
+
+    def find_share(self, token: str) -> ShareLink | None:
+        """Look up a link by its exact token."""
+        row = self._conn.execute(
+            "SELECT * FROM share_links WHERE token=?", (token,)
+        ).fetchone()
+        return ShareLink(**row) if row is not None else None
+
+    def clear_share(self, space_id: int) -> None:
+        """Remove the space's public link if any."""
+        self._require_transaction()
+        self._conn.execute("DELETE FROM share_links WHERE space_id=?", (space_id,))
 
     def _require_transaction(self) -> None:
         if not self._in_transaction:

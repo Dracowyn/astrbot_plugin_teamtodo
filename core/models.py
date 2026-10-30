@@ -251,6 +251,8 @@ class SpaceEventAction(StrEnum):
     - ROLE ``{"user": UserRef.key, "role": [old, new]}``
     - INVITE ``{"expires_at": float}`` (invite created or reset)
     - SYNC ``{"session": str, "added": int}`` (WebUI group member sync, M3.1)
+    - SHARE ``{"op": "on" | "reset" | "off"}`` (public link created, replaced
+      or removed, M4; the token itself is never logged)
 
     Deleting a space deletes its log, so there is no DELETE entry.
     """
@@ -263,6 +265,7 @@ class SpaceEventAction(StrEnum):
     ROLE = "role"
     INVITE = "invite"
     SYNC = "sync"
+    SHARE = "share"
 
 
 @dcs.dataclass(frozen=True)
@@ -301,6 +304,20 @@ class Invite:
     """SHA-256 hex of the normalized code (stripped, uppercased); see
     ``services.access.hash_invite_code``."""
     expires_at: float
+
+
+@dcs.dataclass(frozen=True)
+class ShareLink:
+    """The single public board link of a space (M4).
+
+    The token is stored in plain text so admins can copy the link again; the
+    database already holds every task the link reveals. A space has a link
+    exactly when it is shared: turning sharing off deletes the row.
+    """
+
+    space_id: int
+    token: str
+    created_at: float
 
 
 class TodoError(Exception):

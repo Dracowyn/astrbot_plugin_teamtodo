@@ -16,5 +16,41 @@
     "type": "int",
     "default": 7,
     "hint": "任务完成满这么多天后自动转为已归档；0 表示关闭"
+  },
+  "public_enabled": {
+    "description": "开启公开看板服务",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后插件会单独监听一个端口，提供只读的公开看板页面；修改后需重载插件"
+  },
+  "public_host": {
+    "description": "公开服务监听地址",
+    "type": "string",
+    "default": "127.0.0.1",
+    "hint": "默认只允许本机访问，适合放在反向代理后面；要直接对外访问改成 0.0.0.0"
+  },
+  "public_port": {
+    "description": "公开服务端口",
+    "type": "int",
+    "default": 6200,
+    "hint": "Docker 部署时需要在 compose 里映射这个端口"
+  },
+  "public_base_url": {
+    "description": "对外访问地址",
+    "type": "string",
+    "default": "",
+    "hint": "别人打开看板时用的地址，例如 https://todo.example.com；不填就无法生成分享链接"
+  },
+  "public_rate_limit": {
+    "description": "公开服务限流（每 IP 每分钟请求数）",
+    "type": "int",
+    "default": 60,
+    "hint": "只统计看板数据请求，页面每 30 秒刷新一次"
+  },
+  "public_trust_proxy": {
+    "description": "信任反向代理",
+    "type": "bool",
+    "default": false,
+    "hint": "放在反向代理后面时开启，按 X-Forwarded-For 识别访客 IP 来限流；没有反向代理时不要开启"
   }
 }

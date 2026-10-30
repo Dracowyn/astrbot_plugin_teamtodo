@@ -472,7 +472,7 @@ def test_sqlite_configuration_persistence_and_schema_version(tmp_path):
     assert db._conn.isolation_level is None
     assert db._conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert db._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 3
     trace = []
     db._conn.set_trace_callback(trace.append)
     with db.transaction():
@@ -505,7 +505,7 @@ def test_sqlite_configuration_persistence_and_schema_version(tmp_path):
         assert db.list_bindings("session")[0].bound_at == 123
         with db.transaction():
             assert db.create_task(draft(space.id)).seq == 3
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 3
         assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
         with db.transaction(), pytest.raises(sqlite3.IntegrityError):
             db.create_task(draft(999))
@@ -702,7 +702,7 @@ def test_v1_upgrade_preserves_existing_rows_and_adds_persistent_v2_tables(tmp_pa
     conn.close()
     db = Store(path, clock=lambda: 20)
     try:
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 3
         assert db.get_space(1).name == "legacy"
         assert db.list_bindings("legacy session")[0].bound_at == 11
         assert db.list_events(1)[0].task_seq == 6
