@@ -527,3 +527,62 @@ def test_rollback_restores_existing_task_children_and_sequence(store):
     assert db.get_member(space.id, OTHER) is None
     with db.transaction():
         assert db.create_task(draft(space.id)).seq == 2
+
+
+def test_unreminded_due_filters_and_orders_across_spaces(store):
+    db, _ = store
+    statuses = (TaskStatus.TODO, TaskStatus.DOING)
+    with db.transaction():
+        a = db.create_space("a", None)
+        b = db.create_space("b", None)
+        same_b = db.create_task(draft(b.id, due_at=200))
+        same_a = db.create_task(
+            draft(a.id, due_at=200, assignees=(OWNER,), tags=("tag",))
+        )
+        same_seq = db.create_task(draft(a.id, due_at=200))
+        early = db.create_task(draft(b.id, due_at=100))
+        early = db.update_task(replace(early, status=TaskStatus.DOING))
+        db.create_task(draft(a.id, due_at=201))
+        db.create_task(draft(a.id))
+        reminded = db.create_task(draft(a.id, due_at=50))
+        db.update_task(replace(reminded, reminded=True))
+        for status in (TaskStatus.DONE, TaskStatus.ARCHIVED):
+            task = db.create_task(draft(a.id, due_at=50))
+            db.update_task(replace(task, status=status))
+        assert db.list_unreminded_due(200, statuses) == [
+            early,
+            same_a,
+            same_seq,
+            same_b,
+        ]
+    assert db.list_unreminded_due(200, statuses) == [early, same_a, same_seq, same_b]
+    assert db.list_unreminded_due(99, statuses) == []
+    assert db.list_unreminded_due(200, (TaskStatus.DOING,)) == [early]
+    assert db.list_unreminded_due(200, ()) == []
+    assert db.get_task(a.id, same_a.seq) == same_a
+
+
+def test_done_before_filters_and_orders_across_spaces(store):
+    db, _ = store
+    with db.transaction():
+        a = db.create_space("a", None)
+        b = db.create_space("b", None)
+        tasks = []
+        for space_id, done_at in ((b.id, 200), (a.id, 200), (a.id, 200), (b.id, 100)):
+            task = db.create_task(draft(space_id, assignees=(OWNER,), tags=("done",)))
+            tasks.append(
+                db.update_task(replace(task, status=TaskStatus.DONE, done_at=done_at))
+            )
+        for status, done_at in (
+            (TaskStatus.DONE, 201),
+            (TaskStatus.DONE, None),
+            (TaskStatus.TODO, 50),
+            (TaskStatus.DOING, 50),
+            (TaskStatus.ARCHIVED, 50),
+        ):
+            task = db.create_task(draft(a.id))
+            db.update_task(replace(task, status=status, done_at=done_at))
+        expected = [tasks[3], tasks[1], tasks[2], tasks[0]]
+        assert db.list_done_before(200) == expected
+    assert db.list_done_before(200) == expected
+    assert db.list_done_before(99) == []

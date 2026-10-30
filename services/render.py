@@ -78,7 +78,12 @@ def reminder_text(task: Task, space_name: str, now: float, tz: tzinfo) -> str:
     ``⏰ 空间名#3 标题 将于 11-05 23:59 到期`` when ``due_at >= now``, otherwise
     ``⏰ 空间名#3 标题 已于 11-05 23:59 逾期``. Due time uses ``format_due``.
     """
-    raise NotImplementedError
+    due = format_due(task.due_at, now, tz)
+    if task.due_at >= now:
+        timing = f"将于 {due} 到期"
+    else:
+        timing = f"已于 {due} 逾期"
+    return f"⏰ {space_name}#{task.seq} {task.title} {timing}"
 
 
 def task_detail(

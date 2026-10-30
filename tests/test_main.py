@@ -1,11 +1,21 @@
+import asyncio
 from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 from astrbot_plugin_teamtodo import main
-from astrbot_plugin_teamtodo.core.models import Mention, TodoError, UserRef
+from astrbot_plugin_teamtodo.core.models import (
+    Mention,
+    Task,
+    TaskStatus,
+    TodoError,
+    UserRef,
+)
 from astrbot_plugin_teamtodo.core.permissions import DENIAL_MESSAGES, Op
 from astrbot_plugin_teamtodo.services.access import SessionInfo
+from astrbot_plugin_teamtodo.services.event_context import ASSIGNED_SUFFIX
+from astrbot_plugin_teamtodo.services.reminders import Reminder
 
 import astrbot.api.message_components as Comp
 
@@ -62,6 +72,53 @@ class FakeEvent:
     def plain_result(self, text):
         return text
 
+    def chain_result(self, chain):
+        return chain
+
+
+class FakeContext:
+    """Records registered tools and proactive messages."""
+
+    def __init__(self):
+        self.tools = []
+        self.sent = []
+        self.send_result = True
+        self.send_error = None
+
+    def add_llm_tools(self, *tools):
+        self.tools.extend(tools)
+
+    async def send_message(self, session, chain):
+        if self.send_error is not None:
+            raise self.send_error
+        self.sent.append((session, chain.chain))
+        return self.send_result
+
+
+class FakeReminderService:
+    def __init__(self, store, **kwargs):
+        self.store = store
+        self.kwargs = kwargs
+
+
+class FakeLoop:
+    """Stands in for ``run_loop``: records its arguments and waits forever."""
+
+    def __init__(self, error=None):
+        self.calls = []
+        self.cancelled = False
+        self.error = error
+
+    async def __call__(self, service, send):
+        self.calls.append((service, send))
+        if self.error is not None:
+            raise self.error
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
 
 def owner_group():
     return SimpleNamespace(
@@ -70,12 +127,36 @@ def owner_group():
 
 
 @pytest.fixture
-def plugin(tmp_path, monkeypatch):
+def enabled(monkeypatch):
+    """Per-session plugin switch; flip ``enabled["value"]`` to disable."""
+    state = {"value": True, "calls": []}
+
+    async def is_enabled(session, name):
+        state["calls"].append((session, name))
+        return state["value"]
+
+    monkeypatch.setattr(
+        main.SessionPluginManager,
+        "is_plugin_enabled_for_session",
+        staticmethod(is_enabled),
+    )
+    return state
+
+
+@pytest.fixture
+def loop(monkeypatch):
+    fake = FakeLoop()
+    monkeypatch.setattr(main, "run_loop", fake)
+    monkeypatch.setattr(main, "ReminderService", FakeReminderService)
+    return fake
+
+
+@pytest_asyncio.fixture
+async def plugin(tmp_path, monkeypatch, loop, enabled):
     monkeypatch.setattr(main.StarTools, "get_data_dir", lambda name: tmp_path)
-    instance = main.TeamTodoPlugin(None, {"timezone": "Asia/Shanghai"})
+    instance = main.TeamTodoPlugin(FakeContext(), {"timezone": "Asia/Shanghai"})
     yield instance
-    if instance._store is not None:
-        instance._store.close()
+    await instance.terminate()
 
 
 async def run(plugin, *components, **kwargs):
@@ -217,7 +298,7 @@ async def test_end_to_end_task_commands(plugin):
     deleted = await run(plugin, Comp.Plain(text="/todo delete #1"), **owner)
 
     # Assert
-    assert added[0].startswith("已创建：#1 [待办] 写周报 @Bob")
+    assert added[0][0].text.startswith("已创建：#1 [待办] 写周报 @Bob")
     assert listed[0].startswith("DevTeam\n待办\n#1")
     assert "创建人：Alice" in shown[0]
     assert started[0].startswith("已更新：#1 [进行中]")
@@ -238,7 +319,7 @@ async def test_nameless_mention_renders_as_user_id(plugin):
     listed = await run(plugin, Comp.Plain(text="/todo list"))
 
     # Assert
-    assert added == ["已创建：#1 [待办] 交接 @carol"]
+    assert added[0][0].text == "已创建：#1 [待办] 交接 @carol\n"
     assert "交接 @carol" in listed[0]
 
 
@@ -332,3 +413,235 @@ async def test_terminate_closes_store(plugin):
     assert await run(plugin, Comp.Plain(text="/todo")) == [
         "协作 TODO 插件正在启动，请稍后再试"
     ]
+
+
+# ----- M2: tools, assignment replies, reminders -----------------------------
+
+
+def test_registers_the_six_llm_tools(plugin):
+    # Act
+    names = [tool.name for tool in plugin.context.tools]
+
+    # Assert
+    assert names == [
+        "teamtodo_add_task",
+        "teamtodo_list_tasks",
+        "teamtodo_get_task",
+        "teamtodo_update_task",
+        "teamtodo_list_spaces",
+        "teamtodo_use_space",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({}, (60, 7)),
+        ({"remind_before_minutes": 15, "auto_archive_days": 0}, (15, 0)),
+        ({"remind_before_minutes": -5, "auto_archive_days": -1}, (0, 0)),
+        ({"remind_before_minutes": "30", "auto_archive_days": "x"}, (30, 7)),
+        ({"remind_before_minutes": None, "auto_archive_days": [1]}, (60, 7)),
+    ],
+)
+def test_reminder_config_is_parsed_and_clamped(config, expected, monkeypatch):
+    # Arrange
+    monkeypatch.setattr(main.logger, "warning", lambda *a, **k: None)
+
+    # Act
+    instance = main.TeamTodoPlugin(FakeContext(), config)
+
+    # Assert
+    assert (instance._remind_minutes, instance._archive_days) == expected
+
+
+@pytest.mark.asyncio
+async def test_initialize_starts_reminder_loop_and_terminate_stops_it(plugin, loop):
+    # Arrange
+    plugin._remind_minutes, plugin._archive_days = 30, 3
+
+    # Act
+    await plugin.initialize()
+    await asyncio.sleep(0)
+    service, send = loop.calls[0]
+    await plugin.terminate()
+
+    # Assert
+    assert service.kwargs == {"lead_seconds": 1800, "archive_after_days": 3}
+    assert service.store is not None
+    assert send == plugin._send_reminder
+    assert loop.cancelled is True
+    assert plugin._reminder_task is None
+    assert plugin._store is None and plugin._service is None
+
+
+@pytest.mark.asyncio
+async def test_terminate_logs_a_crashed_reminder_loop(plugin, loop, monkeypatch):
+    # Arrange
+    loop.error = RuntimeError("boom")
+    logged = []
+    monkeypatch.setattr(main.logger, "exception", lambda *a, **k: logged.append(a))
+    await plugin.initialize()
+    await asyncio.sleep(0)
+
+    # Act
+    await plugin.terminate()
+
+    # Assert
+    assert logged
+    assert plugin._store is None
+
+
+def reminder(session, *assignees):
+    task = Task(
+        id=1,
+        space_id=1,
+        seq=3,
+        title="写周报",
+        status=TaskStatus.TODO,
+        assignees=tuple(assignees),
+        due_at=1_800_000_000.0,
+        tags=(),
+        priority=None,
+        description="",
+        creator=UserRef(platform_id="qq", user_id="u1"),
+        created_session=session,
+        created_at=0.0,
+        updated_at=0.0,
+        done_at=None,
+        reminded=True,
+    )
+    return Reminder(
+        session=session, space_name="Dev", task=task, nicknames={"qq:bob": "Bob"}
+    )
+
+
+@pytest.fixture
+def reminder_text(monkeypatch):
+    monkeypatch.setattr(
+        main, "reminder_text", lambda task, space, now, tz: f"[due] {space}#{task.seq}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_group_reminder_mentions_assignees_on_the_same_platform(
+    plugin, reminder_text
+):
+    # Arrange
+    item = reminder(
+        GROUP,
+        UserRef(platform_id="qq", user_id="bob"),
+        UserRef(platform_id="tg", user_id="77"),
+        UserRef(platform_id="qq", user_id="eve"),
+    )
+
+    # Act
+    await plugin._send_reminder(item)
+
+    # Assert
+    session, chain = plugin.context.sent[0]
+    assert session == GROUP
+    assert [(c.qq, c.name) for c in chain[:2]] == [("bob", "Bob"), ("eve", "")]
+    assert len(chain) == 3 and chain[2].text == " [due] Dev#3"
+
+
+@pytest.mark.asyncio
+async def test_private_or_unassigned_reminder_is_text_only(plugin, reminder_text):
+    # Act
+    await plugin._send_reminder(
+        reminder("qq:FriendMessage:u1", UserRef(platform_id="qq", user_id="bob"))
+    )
+    await plugin._send_reminder(reminder(GROUP))
+
+    # Assert
+    assert [[c.text for c in chain] for _, chain in plugin.context.sent] == [
+        ["[due] Dev#3"],
+        ["[due] Dev#3"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reminder_skipped_when_plugin_disabled_for_session(
+    plugin, enabled, reminder_text
+):
+    # Arrange
+    enabled["value"] = False
+
+    # Act
+    await plugin._send_reminder(reminder(GROUP))
+
+    # Assert
+    assert enabled["calls"] == [(GROUP, main.PLUGIN_NAME)]
+    assert plugin.context.sent == []
+
+
+@pytest.mark.asyncio
+async def test_reminder_send_failures_are_only_logged(
+    plugin, reminder_text, monkeypatch
+):
+    # Arrange
+    warnings, errors = [], []
+    monkeypatch.setattr(main.logger, "warning", lambda *a, **k: warnings.append(a))
+    monkeypatch.setattr(main.logger, "exception", lambda *a, **k: errors.append(a))
+    plugin.context.send_result = False
+
+    # Act
+    await plugin._send_reminder(reminder(GROUP))
+    plugin.context.send_error = RuntimeError("network")
+    await plugin._send_reminder(reminder(GROUP))
+    await plugin._send_reminder(reminder("not-a-session"))
+
+    # Assert
+    assert len(warnings) == 1
+    assert len(errors) == 2
+
+
+@pytest.mark.asyncio
+async def test_add_and_assign_mention_new_assignees_in_groups(plugin):
+    # Arrange
+    await plugin.initialize()
+
+    # Act
+    added = await run(
+        plugin, Comp.Plain(text="/todo add 写周报 "), Comp.At(qq="bob", name="Bob")
+    )
+    self_added = await run(
+        plugin, Comp.Plain(text="/todo add 自己的 "), Comp.At(qq="u1", name="Alice")
+    )
+    assigned = await run(
+        plugin,
+        Comp.Plain(text="/todo assign #1 +"),
+        Comp.At(qq="eve", name="Eve"),
+        Comp.Plain(text=" +"),
+        Comp.At(qq="bob", name="Bob"),
+    )
+    removed = await run(
+        plugin, Comp.Plain(text="/todo assign #1 -"), Comp.At(qq="eve", name="Eve")
+    )
+
+    # Assert
+    chain = added[0]
+    assert chain[0].text.startswith("已创建：#1 [待办] 写周报 @Bob")
+    assert chain[0].text.endswith("\n")
+    assert [(c.qq, c.name) for c in chain[1:-1]] == [("bob", "Bob")]
+    assert chain[-1].text == ASSIGNED_SUFFIX
+    assert self_added == ["已创建：#2 [待办] 自己的 @Alice"]
+    assert assigned[0][0].text.startswith("已更新负责人：#1")
+    assert [c.qq for c in assigned[0][1:-1]] == ["eve"]
+    assert isinstance(removed[0], str)
+
+
+@pytest.mark.asyncio
+async def test_private_add_replies_with_plain_text(plugin):
+    # Arrange
+    await plugin.initialize()
+
+    # Act
+    added = await run(
+        plugin,
+        Comp.Plain(text="/todo add 交接 "),
+        Comp.At(qq="bob", name="Bob"),
+        private=True,
+    )
+
+    # Assert
+    assert added == ["已创建：#1 [待办] 交接 @Bob"]

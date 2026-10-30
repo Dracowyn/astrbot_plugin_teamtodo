@@ -15,6 +15,7 @@ from astrbot_plugin_teamtodo.services.render import (
     format_due,
     help_text,
     mine_list,
+    reminder_text,
     spaces_list,
     task_detail,
     task_line,
@@ -306,3 +307,29 @@ def test_help_lists_every_m1_command_and_does_not_advertise_m4_share():
     assert "确认码" in text
     assert "!高" in text and "!中" in text and "!低" in text
     assert "@" in text and "标签" in text
+
+
+@pytest.mark.parametrize(
+    "offset, expected",
+    [
+        (60, "将于 10-30 20:01 到期"),
+        (0, "将于 10-30 20:00 到期"),
+        (-60, "已于 10-30 19:59 逾期"),
+    ],
+)
+def test_reminder_text_due_boundary(offset, expected):
+    task = make_task(due_at=NOW + offset, assignees=(ALICE,))
+    assert (
+        reminder_text(task, "研发", NOW, SHANGHAI) == f"⏰ 研发#3 发布页面 {expected}"
+    )
+
+
+@pytest.mark.parametrize(
+    "year, expected",
+    [(2025, "已于 2025-11-05 23:59 逾期"), (2027, "将于 2027-11-05 23:59 到期")],
+)
+def test_reminder_text_other_year(year, expected):
+    task = make_task(due_at=datetime(year, 11, 5, 15, 59, tzinfo=UTC).timestamp())
+    assert (
+        reminder_text(task, "研发", NOW, SHANGHAI) == f"⏰ 研发#3 发布页面 {expected}"
+    )

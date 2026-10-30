@@ -8,6 +8,7 @@ from astrbot_plugin_teamtodo.core.models import (
     Actor,
     EventAction,
     Mention,
+    Priority,
     SpaceRole,
     TaskStatus,
     TodoError,
@@ -29,6 +30,7 @@ from astrbot_plugin_teamtodo.services.access import (
 )
 from astrbot_plugin_teamtodo.services.todo_service import (
     CONFIRM_MISMATCH,
+    TaskUpdate,
     TodoService,
     auto_space_name,
 )
@@ -811,3 +813,216 @@ def test_delete_space_code_is_bound_to_user(service, space):
     # Act / Assert
     with pytest.raises(TodoError, match=CONFIRM_MISMATCH):
         service.delete_space(root, AUTO, code)
+
+
+# ----- M2: added assignees, combined update, member lookup -----------------
+
+
+def test_add_reports_all_assignees_as_added_and_stores_description(service, space):
+    # Arrange
+    fields = parse_task_fields(["写周报 ", mention("bob")], service.local_now())
+
+    # Act
+    result = service.add_task(MEMBER, AUTO, fields, description="  第一行\n第二行  ")
+
+    # Assert
+    assert result.added_assignees == (user("bob"),)
+    assert result.task.description == "第一行\n第二行"
+
+
+def test_add_rejects_too_long_description(service, space):
+    # Arrange
+    fields = parse_task_fields(["x"], service.local_now())
+
+    # Act / Assert
+    with pytest.raises(TodoError, match="描述不能超过"):
+        service.add_task(MEMBER, AUTO, fields, description="d" * 4001)
+
+
+def test_assign_reports_only_new_assignees(service, space):
+    # Arrange
+    add(service, MEMBER, "x ", mention("bob"))
+
+    # Act
+    replaced = service.assign(
+        MEMBER,
+        AUTO,
+        ref(1),
+        AssignOps(replace=(mention("bob"), mention("eve")), add=(), remove=()),
+    )
+    removed = service.assign(
+        MEMBER, AUTO, ref(1), AssignOps(replace=None, add=(), remove=(mention("eve"),))
+    )
+    unchanged = service.assign(
+        MEMBER, AUTO, ref(1), AssignOps(replace=None, add=(mention("bob"),), remove=())
+    )
+
+    # Assert
+    assert replaced.added_assignees == (user("eve"),)
+    assert removed.added_assignees == ()
+    assert unchanged.added_assignees == ()
+
+
+def test_update_applies_all_fields_and_logs_like_single_operations(
+    service, store, clock, space
+):
+    # Arrange
+    add(service, MEMBER, "旧标题 明天 !高 [a] [b] ", mention("bob"))
+    store_task = store.get_task(space.id, 1)
+    with store.transaction():
+        store.update_task(dcs.replace(store_task, reminded=True))
+    clock.now += 60
+    change = TaskUpdate(
+        status=TaskStatus.DONE,
+        title="新标题",
+        due_at=clock.now + 3600,
+        priority=Priority.LOW,
+        add_tags=("c",),
+        remove_tags=("a",),
+        description="说明",
+        add_assignees=(mention("eve"),),
+        remove_assignees=(user("bob"),),
+    )
+
+    # Act
+    result = service.update_task(MEMBER, AUTO, ref(1), change)
+
+    # Assert
+    task = result.task
+    assert (task.title, task.priority, task.tags) == (
+        "新标题",
+        Priority.LOW,
+        ("b", "c"),
+    )
+    assert task.description == "说明"
+    assert task.due_at == clock.now + 3600
+    assert task.reminded is False
+    assert task.assignees == (user("eve"),)
+    assert result.added_assignees == (user("eve"),)
+    assert task.status == TaskStatus.DONE and task.done_at == clock.now
+    assert store.get_member(space.id, user("eve")).nickname == "name-eve"
+    events = list(reversed(store.list_events(space.id, 1)))
+    assert [e.action for e in events] == [
+        EventAction.CREATE,
+        EventAction.UPDATE,
+        EventAction.ASSIGN,
+        EventAction.STATUS,
+    ]
+    assert set(events[1].detail) == {
+        "title",
+        "due_at",
+        "priority",
+        "tags",
+        "description",
+    }
+    assert events[2].detail == {"assignees": [["qq:bob"], ["qq:eve"]]}
+    assert events[3].detail == {"status": ["todo", "done"]}
+
+
+def test_update_archive_keeps_done_at_and_reopen_clears_it(
+    service, store, clock, space
+):
+    # Arrange
+    add(service, MEMBER, "x")
+    service.update_task(MEMBER, AUTO, ref(1), TaskUpdate(status=TaskStatus.DONE))
+    done_at = clock.now
+    clock.now += 100
+
+    # Act
+    archived = service.update_task(
+        MEMBER, AUTO, ref(1), TaskUpdate(status=TaskStatus.ARCHIVED)
+    ).task
+    reopened = service.update_task(
+        MEMBER, AUTO, ref(1), TaskUpdate(status=TaskStatus.TODO)
+    ).task
+
+    # Assert
+    assert archived.done_at == done_at
+    assert store.list_events(space.id, 1)[1].action == EventAction.ARCHIVE
+    assert reopened.done_at is None
+
+
+def test_update_clears_due_priority_and_description(service, space):
+    # Arrange
+    add(service, MEMBER, "x 明天 !高")
+    service.set_description(MEMBER, AUTO, ref(1), "说明")
+
+    # Act
+    task = service.update_task(
+        MEMBER,
+        AUTO,
+        ref(1),
+        TaskUpdate(clear_due=True, clear_priority=True, description=""),
+    ).task
+
+    # Assert
+    assert (task.due_at, task.priority, task.description) == (None, None, "")
+
+
+def test_update_is_all_or_nothing(service, store, space):
+    # Arrange
+    add(service, MEMBER, "x")
+    before = store.get_task(space.id, 1)
+    events_before = len(store.list_events(space.id, 1))
+    change = TaskUpdate(
+        status=TaskStatus.DONE,
+        add_assignees=(mention("eve"),),
+        title="t" * 201,
+    )
+
+    # Act
+    with pytest.raises(TodoError, match="标题不能超过"):
+        service.update_task(MEMBER, AUTO, ref(1), change)
+
+    # Assert
+    assert store.get_task(space.id, 1) == before
+    assert len(store.list_events(space.id, 1)) == events_before
+    assert store.get_member(space.id, user("eve")) is None
+
+
+def test_update_without_effect_writes_nothing(service, store, space):
+    # Arrange
+    add(service, MEMBER, "x")
+    before = store.get_task(space.id, 1)
+
+    # Act
+    result = service.update_task(
+        MEMBER, AUTO, ref(1), TaskUpdate(title="x", status=TaskStatus.TODO)
+    )
+
+    # Assert
+    assert result.task == before
+    assert result.added_assignees == ()
+    assert len(store.list_events(space.id, 1)) == 1
+
+
+def test_update_requires_edit_permission(service, store, space):
+    # Arrange
+    add(service, MEMBER, "x")
+
+    # Act / Assert
+    with pytest.raises(TodoError, match=DENIAL_MESSAGES[Op.EDIT_TASK]):
+        service.update_task(OTHER, AUTO, ref(1), TaskUpdate(status=TaskStatus.DONE))
+    assert store.get_task(space.id, 1).status == TaskStatus.TODO
+
+
+def test_find_members_matches_exact_nickname_ignoring_case(service, store, space):
+    # Arrange
+    with store.transaction():
+        store.upsert_member(space.id, user("b1"), "Bob")
+        store.upsert_member(space.id, user("b2"), "bob")
+        store.upsert_member(space.id, user("b3"), "Bobby")
+
+    # Act
+    found = service.find_members(MEMBER, AUTO, "  BOB ")
+    empty = service.find_members(MEMBER, AUTO, "   ")
+
+    # Assert
+    assert {m.user for m in found} == {user("b1"), user("b2")}
+    assert empty == []
+
+
+def test_find_members_requires_bound_space(service, space):
+    # Act / Assert
+    with pytest.raises(TodoError, match="没有绑定"):
+        service.find_members(MEMBER, AUTO, "bob", "Elsewhere")

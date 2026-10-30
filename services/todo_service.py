@@ -32,6 +32,8 @@ from ..core.models import (
     EventAction,
     Invite,
     Member,
+    Mention,
+    Priority,
     Space,
     SpaceRole,
     Task,
@@ -39,6 +41,7 @@ from ..core.models import (
     TaskEventDraft,
     TaskStatus,
     TodoError,
+    UserRef,
 )
 from ..core.parsing import AssignOps, TaskFields, TaskRef
 from ..core.store import Store
@@ -83,6 +86,31 @@ class TaskResult:
     space: Space
     task: Task
     nicknames: dict[str, str]
+    added_assignees: tuple[UserRef, ...] = ()
+    """Users that became assignees in this operation (for notifications)."""
+
+
+@dcs.dataclass(frozen=True)
+class TaskUpdate:
+    """A combined task change; every field left at its default is kept.
+
+    ``title``, ``due_at``, ``priority``, ``description`` and ``status`` replace
+    the current value when not ``None``; ``clear_due`` / ``clear_priority``
+    win over the corresponding value. An empty ``description`` clears it.
+    """
+
+    status: TaskStatus | None = None
+    title: str | None = None
+    due_at: float | None = None
+    clear_due: bool = False
+    priority: Priority | None = None
+    clear_priority: bool = False
+    add_tags: tuple[str, ...] = ()
+    remove_tags: tuple[str, ...] = ()
+    description: str | None = None
+    add_assignees: tuple[Mention, ...] = ()
+    """They become members of the space (as in ``assign``), then assignees."""
+    remove_assignees: tuple[UserRef, ...] = ()
 
 
 @dcs.dataclass(frozen=True)
@@ -185,8 +213,15 @@ class TodoService:
                 return candidate
         raise AssertionError("unreachable")  # pragma: no cover
 
-    def _result(self, space: Space, task: Task) -> TaskResult:
-        return TaskResult(space=space, task=task, nicknames=self._nicknames(space.id))
+    def _result(
+        self, space: Space, task: Task, added: tuple[UserRef, ...] = ()
+    ) -> TaskResult:
+        return TaskResult(
+            space=space,
+            task=task,
+            nicknames=self._nicknames(space.id),
+            added_assignees=added,
+        )
 
     def _nicknames(self, space_id: int) -> dict[str, str]:
         # Empty nicknames (e.g. a mention without a name) fall back to user_id
@@ -208,6 +243,95 @@ class TodoService:
                 session=actor.session,
             )
         )
+
+    def _apply(
+        self, actor: Actor, space: Space, member: Member, task: Task, change: TaskUpdate
+    ) -> Task | None:
+        """Check permission, apply ``change`` to ``task`` and log it.
+
+        Runs inside the caller's transaction. Status follows ``set_status``
+        (DONE sets ``done_at`` to now, ARCHIVED keeps it, TODO/DOING clear it);
+        a new ``due_at`` resets ``reminded``. One event is logged per kind of
+        change, in the formats of the single-purpose operations: UPDATE for
+        fields, ASSIGN for assignees, STATUS or ARCHIVE for the status.
+
+        Returns:
+            The saved task, or ``None`` when nothing changed (nothing is
+            written then, except that added assignees still become members).
+
+        Raises:
+            TodoError: Permission denied or a violated limit.
+        """
+        perms.require(perms.can_edit_task(actor, member, task), perms.Op.EDIT_TASK)
+        if change.clear_due:
+            due_at = None
+        else:
+            due_at = task.due_at if change.due_at is None else change.due_at
+        if change.clear_priority:
+            priority = None
+        else:
+            priority = change.priority or task.priority
+        tags = dict.fromkeys((*task.tags, *change.add_tags))
+        merged = dict.fromkeys(
+            (*task.assignees, *(m.user for m in change.add_assignees))
+        )
+        updated = dcs.replace(
+            task,
+            title=task.title if change.title is None else change.title,
+            due_at=due_at,
+            priority=priority,
+            tags=tuple(tag for tag in tags if tag not in change.remove_tags),
+            description=(
+                task.description
+                if change.description is None
+                else change.description.strip()
+            ),
+            assignees=tuple(
+                user for user in merged if user not in change.remove_assignees
+            ),
+        )
+        fields = {
+            name: [getattr(task, name), getattr(updated, name)]
+            for name in ("title", "due_at", "priority", "tags", "description")
+            if getattr(task, name) != getattr(updated, name)
+        }
+        assignees_changed = updated.assignees != task.assignees
+        if fields or assignees_changed:
+            self._check_task(updated)
+        for mention in change.add_assignees:
+            self._store.upsert_member(space.id, mention.user, mention.name)
+        status = change.status or task.status
+        if status != task.status:
+            if status == TaskStatus.DONE:
+                done_at = self._clock()
+            elif status == TaskStatus.ARCHIVED:
+                done_at = task.done_at
+            else:
+                done_at = None
+            updated = dcs.replace(updated, status=status, done_at=done_at)
+        elif not fields and not assignees_changed:
+            return None
+        if "due_at" in fields:
+            updated = dcs.replace(updated, reminded=False)
+        saved = self._store.update_task(updated)
+        if fields:
+            self._log(actor, saved, EventAction.UPDATE, fields)
+        if assignees_changed:
+            detail = {
+                "assignees": [
+                    [user.key for user in task.assignees],
+                    [user.key for user in saved.assignees],
+                ]
+            }
+            self._log(actor, saved, EventAction.ASSIGN, detail)
+        if status != task.status:
+            action = (
+                EventAction.ARCHIVE
+                if status == TaskStatus.ARCHIVED
+                else EventAction.STATUS
+            )
+            self._log(actor, saved, action, {"status": [task.status, status]})
+        return saved
 
     @staticmethod
     def _check_task(task: Task | TaskDraft) -> None:
@@ -245,6 +369,7 @@ class TodoService:
         auto_name: str,
         fields: TaskFields,
         space_name: str | None = None,
+        description: str = "",
     ) -> TaskResult:
         """Create a task; mentioned users become members and assignees.
 
@@ -253,9 +378,10 @@ class TodoService:
             auto_name: Base name if the session's space must be auto-created.
             fields: Parsed fields; removal and clear flags are ignored.
             space_name: Bound space to use instead of the current one.
+            description: Initial Markdown description (stripped).
 
         Returns:
-            The created task.
+            The created task; every assignee counts as added.
 
         Raises:
             TodoError: Unbound space name or a violated limit.
@@ -271,13 +397,14 @@ class TodoService:
                 due_at=fields.due_at,
                 tags=fields.add_tags,
                 priority=fields.priority,
+                description=description.strip(),
             )
             self._check_task(draft)
             for mention in fields.mentions:
                 self._store.upsert_member(space.id, mention.user, mention.name)
             task = self._store.create_task(draft)
             self._log(actor, task, EventAction.CREATE, {"title": task.title})
-            return self._result(space, task)
+            return self._result(space, task, task.assignees)
 
     def list_tasks(
         self,
@@ -350,25 +477,8 @@ class TodoService:
         """
         with self._store.transaction():
             space, member, task = self._task(actor, auto_name, ref)
-            perms.require(perms.can_edit_task(actor, member, task), perms.Op.EDIT_TASK)
-            if task.status == status:
-                return self._result(space, task)
-            if status == TaskStatus.DONE:
-                done_at = self._clock()
-            elif status == TaskStatus.ARCHIVED:
-                done_at = task.done_at
-            else:
-                done_at = None
-            saved = self._store.update_task(
-                dcs.replace(task, status=status, done_at=done_at)
-            )
-            action = (
-                EventAction.ARCHIVE
-                if status == TaskStatus.ARCHIVED
-                else EventAction.STATUS
-            )
-            self._log(actor, saved, action, {"status": [task.status, status]})
-            return self._result(space, saved)
+            saved = self._apply(actor, space, member, task, TaskUpdate(status=status))
+            return self._result(space, saved or task)
 
     def assign(
         self, actor: Actor, auto_name: str, ref: TaskRef, ops: AssignOps
@@ -382,7 +492,7 @@ class TodoService:
             ops: Parsed assign arguments.
 
         Returns:
-            The task after the change.
+            The task after the change, with the users not assigned before.
 
         Raises:
             TodoError: Unknown task, permission denied or too many assignees.
@@ -412,7 +522,8 @@ class TodoService:
                 ]
             }
             self._log(actor, saved, EventAction.ASSIGN, detail)
-            return self._result(space, saved)
+            added = tuple(user for user in assignees if user not in task.assignees)
+            return self._result(space, saved, added)
 
     def edit_task(
         self, actor: Actor, auto_name: str, ref: TaskRef, fields: TaskFields
@@ -437,31 +548,20 @@ class TodoService:
         """
         if fields.mentions:
             raise TodoError("修改负责人请使用 /todo assign")
+        change = TaskUpdate(
+            title=fields.title or None,
+            due_at=fields.due_at,
+            clear_due=fields.clear_due,
+            priority=fields.priority,
+            clear_priority=fields.clear_priority,
+            add_tags=fields.add_tags,
+            remove_tags=fields.remove_tags,
+        )
         with self._store.transaction():
             space, member, task = self._task(actor, auto_name, ref)
-            perms.require(perms.can_edit_task(actor, member, task), perms.Op.EDIT_TASK)
-            due_at = task.due_at if fields.due_at is None else fields.due_at
-            priority = fields.priority or task.priority
-            tags = dict.fromkeys((*task.tags, *fields.add_tags))
-            updated = dcs.replace(
-                task,
-                title=fields.title or task.title,
-                due_at=None if fields.clear_due else due_at,
-                priority=None if fields.clear_priority else priority,
-                tags=tuple(tag for tag in tags if tag not in fields.remove_tags),
-            )
-            changes = {
-                name: [getattr(task, name), getattr(updated, name)]
-                for name in ("title", "due_at", "priority", "tags")
-                if getattr(task, name) != getattr(updated, name)
-            }
-            if not changes:
+            saved = self._apply(actor, space, member, task, change)
+            if saved is None:
                 raise TodoError("没有需要修改的内容")
-            if "due_at" in changes:
-                updated = dcs.replace(updated, reminded=False)
-            self._check_task(updated)
-            saved = self._store.update_task(updated)
-            self._log(actor, saved, EventAction.UPDATE, changes)
             return self._result(space, saved)
 
     def set_description(
@@ -483,15 +583,75 @@ class TodoService:
         """
         with self._store.transaction():
             space, member, task = self._task(actor, auto_name, ref)
-            perms.require(perms.can_edit_task(actor, member, task), perms.Op.EDIT_TASK)
-            updated = dcs.replace(task, description=text.strip())
-            self._check_task(updated)
-            if updated.description == task.description:
+            change = TaskUpdate(description=text)
+            saved = self._apply(actor, space, member, task, change)
+            return self._result(space, saved or task)
+
+    def update_task(
+        self, actor: Actor, auto_name: str, ref: TaskRef, change: TaskUpdate
+    ) -> TaskResult:
+        """Apply a combined change atomically (used by the LLM tool).
+
+        Either every part of ``change`` is applied or, on any error, none.
+        Permission and logging follow the single-purpose operations; an
+        update that changes nothing returns the task as it is.
+
+        Args:
+            actor: The requesting user.
+            auto_name: Base name if the session's space must be auto-created.
+            ref: Task reference.
+            change: The requested changes.
+
+        Returns:
+            The task after the change, with the users not assigned before.
+
+        Raises:
+            TodoError: Unknown task, permission denied or a violated limit.
+        """
+        with self._store.transaction():
+            space, member, task = self._task(actor, auto_name, ref)
+            saved = self._apply(actor, space, member, task, change)
+            if saved is None:
                 return self._result(space, task)
-            saved = self._store.update_task(updated)
-            detail = {"description": [task.description, saved.description]}
-            self._log(actor, saved, EventAction.UPDATE, detail)
-            return self._result(space, saved)
+            added = tuple(
+                user for user in saved.assignees if user not in task.assignees
+            )
+            return self._result(space, saved, added)
+
+    def find_members(
+        self,
+        actor: Actor,
+        auto_name: str,
+        nickname: str,
+        space_name: str | None = None,
+    ) -> list[Member]:
+        """Members of the target space whose nickname equals ``nickname``.
+
+        The comparison ignores case and surrounding whitespace; there is no
+        fuzzy matching. Used to resolve assignee names given by the LLM.
+
+        Args:
+            actor: The requesting user.
+            auto_name: Base name if the session's space must be auto-created.
+            nickname: Display name to look up.
+            space_name: Bound space to search instead of the current one.
+
+        Returns:
+            Matching members (empty, one, or several when ambiguous).
+
+        Raises:
+            TodoError: Unbound space name.
+        """
+        key = nickname.strip().casefold()
+        with self._store.transaction():
+            space, _ = self._space(actor, auto_name, space_name)
+            if not key:
+                return []
+            return [
+                member
+                for member in self._store.list_members(space.id)
+                if member.nickname.strip().casefold() == key
+            ]
 
     def delete_task(self, actor: Actor, auto_name: str, ref: TaskRef) -> TaskResult:
         """Hard-delete a task, logging a full snapshot (creator or admin).

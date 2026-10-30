@@ -575,12 +575,27 @@ class Store:
         """Tasks in any space with ``reminded`` false, a non-null ``due_at``
         <= ``due_before`` and a status in ``statuses``, ordered by ``due_at``,
         then ``space_id``, ``seq``. (M2)"""
-        raise NotImplementedError
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        rows = self._conn.execute(
+            f"""SELECT * FROM tasks
+                WHERE reminded=0 AND due_at IS NOT NULL AND due_at<=?
+                AND status IN ({placeholders})
+                ORDER BY due_at, space_id, seq""",
+            (due_before, *statuses),
+        )
+        return [self._task(row) for row in rows]
 
     def list_done_before(self, done_before: float) -> list[Task]:
         """DONE tasks in any space with ``done_at`` <= ``done_before``,
         ordered by ``done_at``, then ``space_id``, ``seq``. (M2)"""
-        raise NotImplementedError
+        rows = self._conn.execute(
+            """SELECT * FROM tasks WHERE status=? AND done_at<=?
+               ORDER BY done_at, space_id, seq""",
+            (TaskStatus.DONE, done_before),
+        )
+        return [self._task(row) for row in rows]
 
     # ----- operation log -----
 

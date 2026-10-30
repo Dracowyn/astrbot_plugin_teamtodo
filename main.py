@@ -7,28 +7,36 @@ plugin's ``main`` module). The business logic is in ``services/``.
 instead of a ``command_group``: AstrBot answers a bare group command with its
 own "missing arguments" tree, while the design requires bare ``/todo`` to show
 the plugin's help text.
+
+The plugin also registers the LLM tools (``services/llm_tools.py``) and runs
+the due-reminder loop (``services/reminders.py``), whose messages are sent
+from here.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import re
+import time
 from collections.abc import Callable
 from datetime import timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.platform import MessageType
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.platform.message_session import MessageSession
+from astrbot.core.star.session_plugin_manager import SessionPluginManager
 
 from .core.models import (
     Actor,
-    Mention,
     SpaceRole,
     Task,
     TaskStatus,
     TodoError,
-    UserRef,
 )
 from .core.parsing import (
     Part,
@@ -43,12 +51,20 @@ from .services.access import (
     ConfirmationCodes,
     JoinRateLimiter,
     SessionAdminResolver,
-    SessionInfo,
 )
+from .services.event_context import (
+    PLUGIN_NAME,
+    assignment_chain,
+    build_actor,
+    message_parts,
+)
+from .services.llm_tools import TeamTodoToolkit
+from .services.reminders import Reminder, ReminderService, run_loop
 from .services.render import (
     format_due,
     help_text,
     mine_list,
+    reminder_text,
     spaces_list,
     task_detail,
     task_line,
@@ -56,9 +72,12 @@ from .services.render import (
 )
 from .services.todo_service import TodoService, auto_space_name
 
-PLUGIN_NAME = "astrbot_plugin_teamtodo"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+DEFAULT_REMIND_BEFORE_MINUTES = 60
+DEFAULT_AUTO_ARCHIVE_DAYS = 7
 GENERIC_FAILURE = "操作失败，请稍后再试"
+Reply = str | list[Comp.BaseMessageComponent]
+"""A command reply: plain text, or a chain that mentions new assignees."""
 STATUS_COMMANDS = {
     "start": TaskStatus.DOING,
     "done": TaskStatus.DONE,
@@ -87,63 +106,6 @@ def load_timezone(name: str) -> tzinfo:
         return ZoneInfo(DEFAULT_TIMEZONE)
     except ZoneInfoNotFoundError:
         return timezone(timedelta(hours=8), DEFAULT_TIMEZONE)
-
-
-def message_parts(event: AstrMessageEvent) -> list[Part]:
-    """Convert the message chain into parser parts.
-
-    ``Plain`` becomes text and ``At`` becomes a ``Mention``; ``@all`` and
-    mentions of the bot itself are dropped, other components are ignored.
-
-    Args:
-        event: The incoming message event.
-
-    Returns:
-        Parts in message order.
-    """
-    platform_id = event.get_platform_id()
-    self_id = str(event.get_self_id())
-    parts: list[Part] = []
-    for component in event.get_messages():
-        if isinstance(component, Comp.Plain):
-            parts.append(component.text)
-        elif isinstance(component, Comp.At):
-            user_id = str(component.qq)
-            if user_id in ("all", self_id):
-                continue
-            parts.append(
-                Mention(
-                    user=UserRef(platform_id=platform_id, user_id=user_id),
-                    name=component.name or "",
-                )
-            )
-    return parts
-
-
-def build_actor(event: AstrMessageEvent, info: SessionInfo) -> Actor:
-    """Build the acting user from the event only (never from LLM input).
-
-    Args:
-        event: The incoming message event.
-        info: Session admin status from ``SessionAdminResolver``.
-
-    Returns:
-        The actor.
-
-    Raises:
-        TodoError: The platform did not provide a sender id.
-    """
-    sender_id = str(event.get_sender_id() or "")
-    if not sender_id:
-        raise TodoError("无法识别发送者")
-    return Actor(
-        user=UserRef(platform_id=event.get_platform_id(), user_id=sender_id),
-        nickname=event.get_sender_name() or sender_id,
-        session=event.unified_msg_origin,
-        is_private=event.is_private_chat(),
-        is_bot_admin=event.is_admin(),
-        is_session_admin=info.is_session_admin,
-    )
 
 
 def split_word(parts: list[Part]) -> tuple[str, list[Part]]:
@@ -176,9 +138,30 @@ class TeamTodoPlugin(Star):
         self._resolver = SessionAdminResolver()
         self._joins = JoinRateLimiter()
         self._confirms = ConfirmationCodes()
+        self._reminder_task: asyncio.Task | None = None
+        limits = {}
+        for key, default in (
+            ("remind_before_minutes", DEFAULT_REMIND_BEFORE_MINUTES),
+            ("auto_archive_days", DEFAULT_AUTO_ARCHIVE_DAYS),
+        ):
+            try:
+                limits[key] = max(0, int(config.get(key, default)))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "[teamtodo] Invalid %s %r; using %s", key, config.get(key), default
+                )
+                limits[key] = default
+        self._remind_minutes = limits["remind_before_minutes"]
+        self._archive_days = limits["auto_archive_days"]
+        # Tools read the service lazily: it is None before initialize() and
+        # after terminate(). AstrBot drops this plugin's tools on reload and
+        # replaces same-named tools on registration, so none outlive the store.
+        context.add_llm_tools(
+            *TeamTodoToolkit(lambda: self._service, self._resolver).build()
+        )
 
     async def initialize(self) -> None:
-        """Open the database and build the service."""
+        """Open the database, build the services and start the reminder loop."""
         db_path = StarTools.get_data_dir(PLUGIN_NAME) / "teamtodo.db"
         self._store = Store(db_path)
         self._service = TodoService(
@@ -187,13 +170,71 @@ class TeamTodoPlugin(Star):
             join_limiter=self._joins,
             confirmations=self._confirms,
         )
+        reminders = ReminderService(
+            self._store,
+            lead_seconds=self._remind_minutes * 60,
+            archive_after_days=self._archive_days,
+        )
+        self._reminder_task = asyncio.create_task(
+            run_loop(reminders, self._send_reminder)
+        )
 
     async def terminate(self) -> None:
-        """Close the database."""
+        """Stop the reminder loop, then close the database."""
+        task, self._reminder_task = self._reminder_task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                try:
+                    await task
+                except Exception:
+                    logger.exception("[teamtodo] Reminder loop ended with an error")
         self._service = None
         if self._store is not None:
             self._store.close()
             self._store = None
+
+    async def _send_reminder(self, reminder: Reminder) -> None:
+        """Deliver one due reminder (the ``send`` callback of ``run_loop``).
+
+        Skipped when the plugin is disabled for the target session. In a group
+        the assignees on the session's platform are mentioned before the text.
+        Failures are logged only: ``send_message`` returning True means a
+        platform was found, not that the message was delivered.
+
+        Args:
+            reminder: The reminder chosen by ``ReminderService``.
+        """
+        session = reminder.session
+        try:
+            if not await SessionPluginManager.is_plugin_enabled_for_session(
+                session, PLUGIN_NAME
+            ):
+                logger.debug(
+                    "[teamtodo] Plugin disabled in %s; reminder skipped", session
+                )
+                return
+            target = MessageSession.from_str(session)
+            text = reminder_text(
+                reminder.task, reminder.space_name, time.time(), self._tz
+            )
+            mentions = []
+            if target.message_type == MessageType.GROUP_MESSAGE:
+                # Ids from another platform could point at an unrelated user here.
+                mentions = [
+                    Comp.At(
+                        qq=user.user_id, name=reminder.nicknames.get(user.key) or ""
+                    )
+                    for user in reminder.task.assignees
+                    if user.platform_id == target.platform_id
+                ]
+            chain = [*mentions, Comp.Plain(text=f" {text}" if mentions else text)]
+            if not await self.context.send_message(session, MessageChain(chain=chain)):
+                logger.warning(
+                    "[teamtodo] No platform found for reminder to %s", session
+                )
+        except Exception:
+            logger.exception("[teamtodo] Failed to send reminder to %s", session)
 
     @filter.command("todo")
     async def todo(self, event: AstrMessageEvent):
@@ -214,9 +255,12 @@ class TeamTodoPlugin(Star):
         except Exception:
             logger.exception("[teamtodo] /todo command failed")
             reply = GENERIC_FAILURE
-        yield event.plain_result(reply)
+        if isinstance(reply, list):
+            yield event.chain_result(reply)
+        else:
+            yield event.plain_result(reply)
 
-    def _dispatch(self, actor: Actor, auto_name: str, args: list[Part]) -> str:
+    def _dispatch(self, actor: Actor, auto_name: str, args: list[Part]) -> Reply:
         """Route ``/todo <sub> ...`` to its handler and return the reply.
 
         Args:
@@ -225,7 +269,7 @@ class TeamTodoPlugin(Star):
             args: Parts after ``todo``.
 
         Returns:
-            Reply text.
+            Reply text, or a message chain when new assignees are mentioned.
 
         Raises:
             TodoError: User-facing failure.
@@ -243,7 +287,7 @@ class TeamTodoPlugin(Star):
         if sub == "space":
             sub, rest = split_word(rest)
             sub = f"space {sub.casefold()}"
-        handler: Callable[[Actor, str, list[Part]], str] | None = {
+        handler: Callable[[Actor, str, list[Part]], Reply] | None = {
             "add": self._add,
             "list": self._list,
             "mine": self._mine,
@@ -280,10 +324,12 @@ class TeamTodoPlugin(Star):
 
     # ----- task commands -----
 
-    def _add(self, actor: Actor, auto_name: str, args: list[Part]) -> str:
+    def _add(self, actor: Actor, auto_name: str, args: list[Part]) -> Reply:
         fields = parse_task_fields(args, self._service.local_now())
         result = self._service.add_task(actor, auto_name, fields)
-        return f"已创建：{self._line(result.task, result.nicknames)}"
+        text = f"已创建：{self._line(result.task, result.nicknames)}"
+        added, nicknames = result.added_assignees, result.nicknames
+        return assignment_chain(text, actor, added, nicknames) or text
 
     def _list(self, actor: Actor, auto_name: str, args: list[Part]) -> str:
         words = text_of(args).split()
@@ -316,10 +362,12 @@ class TeamTodoPlugin(Star):
             self._service.tz,
         )
 
-    def _assign(self, actor: Actor, auto_name: str, args: list[Part]) -> str:
+    def _assign(self, actor: Actor, auto_name: str, args: list[Part]) -> Reply:
         ref, rest = split_ref(args)
         result = self._service.assign(actor, auto_name, ref, parse_assign(rest))
-        return f"已更新负责人：{self._line(result.task, result.nicknames)}"
+        text = f"已更新负责人：{self._line(result.task, result.nicknames)}"
+        added, nicknames = result.added_assignees, result.nicknames
+        return assignment_chain(text, actor, added, nicknames) or text
 
     def _edit(self, actor: Actor, auto_name: str, args: list[Part]) -> str:
         ref, rest = split_ref(args)
