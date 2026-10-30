@@ -2,6 +2,7 @@ import asyncio
 import json
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -9,6 +10,7 @@ from astrbot_plugin_teamtodo import main
 from astrbot_plugin_teamtodo.core.models import (
     GroupMember,
     Mention,
+    SpaceEventAction,
     SpaceRole,
     Task,
     TaskStatus,
@@ -187,6 +189,14 @@ async def plugin(tmp_path, monkeypatch, loop, enabled):
 async def run(plugin, *components, **kwargs):
     event = FakeEvent(*components, **kwargs)
     return [reply async for reply in plugin.todo(event)]
+
+
+@pytest.fixture
+def admin_group_members(monkeypatch):
+    """Fake group membership without replacing the command's real store."""
+    fetch = AsyncMock(return_value=[])
+    monkeypatch.setattr(main.group_members, "from_event", fetch)
+    return fetch
 
 
 def test_message_parts_converts_plain_and_mentions():
@@ -393,6 +403,297 @@ async def test_end_to_end_space_commands(plugin):
     assert left == ["本会话已解绑空间「Ops」，空间和任务仍然保留"]
     assert "60 秒内" in confirm[0]
     assert deleted == ["已删除空间「Core」及其全部任务"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("private", [False, True], ids=["group", "private"])
+@pytest.mark.parametrize("nickname", ["Saved Name", ""], ids=["named", "nameless"])
+async def test_admin_existing_raw_id_preserves_name_without_fetch(
+    plugin, admin_group_members, private, nickname
+):
+    """Use persisted names, falling back to the ID, in either chat type."""
+    await plugin.initialize()
+    context = {"private": private, "group": owner_group()}
+    await run(plugin, Comp.Plain(text="/todo list"), **context)
+    target = UserRef(platform_id="qq", user_id="123456")
+    with plugin._store.transaction():
+        plugin._store.upsert_member(1, target, nickname)
+
+    promoted = await run(plugin, Comp.Plain(text="/todo admin +123456"), **context)
+    member = plugin._store.get_member(1, target)
+    assert member.role is SpaceRole.ADMIN
+    assert member.nickname == nickname
+    assert f"{nickname or '123456'}：管理员" in promoted[0]
+
+    revoked = await run(plugin, Comp.Plain(text="/todo admin -123456"), **context)
+
+    member = plugin._store.get_member(1, target)
+    assert member.role is SpaceRole.MEMBER
+    assert member.nickname == nickname
+    assert f"{nickname or '123456'}：成员" in revoked[0]
+    events = plugin._store.list_space_events(1)[:2]
+    assert [(event.action, event.detail) for event in events] == [
+        (SpaceEventAction.ROLE, {"user": target.key, "role": ["admin", "member"]}),
+        (SpaceEventAction.ROLE, {"user": target.key, "role": ["member", "admin"]}),
+    ]
+    admin_group_members.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_unknown_raw_id_registers_group_name_and_actor_platform(
+    plugin, monkeypatch, admin_group_members
+):
+    """Resolve IDs in the actor's platform instance and persist the role log."""
+    monkeypatch.setattr(FakeEvent, "get_platform_id", lambda self: "qq-instance")
+    target = UserRef(platform_id="qq-instance", user_id="123456")
+    wrong_platform = UserRef(platform_id="qq", user_id="123456")
+    admin_group_members.return_value = [
+        GroupMember(wrong_platform, "Other Instance", ("Other Instance",)),
+        GroupMember(target, "Group Card", ("Group Card", "Account Name")),
+    ]
+    await plugin.initialize()
+
+    replies = await run(
+        plugin, Comp.Plain(text="/todo admin +123456"), group=owner_group()
+    )
+
+    member = plugin._store.get_member(1, target)
+    assert member is not None
+    assert member.role is SpaceRole.ADMIN
+    assert member.nickname == "Group Card"
+    assert plugin._store.get_member(1, wrong_platform) is None
+    assert "Group Card：管理员" in replies[0]
+    event = plugin._store.list_space_events(1)[0]
+    assert event.action is SpaceEventAction.ROLE
+    assert event.detail == {"user": target.key, "role": ["member", "admin"]}
+    assert event.actor == UserRef(platform_id="qq-instance", user_id="u1")
+    assert event.session == GROUP
+    admin_group_members.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("members", [[], None], ids=["missing", "unavailable"])
+async def test_admin_unknown_raw_id_group_miss_is_clear_and_does_not_write(
+    plugin, admin_group_members, members
+):
+    """Missing or unavailable group membership cannot authorize registration."""
+    await plugin.initialize()
+    await run(plugin, Comp.Plain(text="/todo list"), group=owner_group())
+    baseline_members = plugin._store.list_members(1)
+    baseline_events = plugin._store.list_space_events(1)
+    admin_group_members.return_value = members
+
+    replies = await run(
+        plugin, Comp.Plain(text="/todo admin +123456"), group=owner_group()
+    )
+
+    assert replies == ["找不到 QQ 号 123456：不是空间成员，也不在本群成员列表里"]
+    assert plugin._store.list_members(1) == baseline_members
+    assert plugin._store.list_space_events(1) == baseline_events
+    admin_group_members.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_unknown_raw_id_in_private_never_fetches(
+    plugin, admin_group_members
+):
+    """Private chats cannot establish a raw target's group membership."""
+    await plugin.initialize()
+    await run(plugin, Comp.Plain(text="/todo list"), private=True)
+    baseline_members = plugin._store.list_members(1)
+    baseline_events = plugin._store.list_space_events(1)
+
+    replies = await run(plugin, Comp.Plain(text="/todo admin +123456"), private=True)
+
+    assert replies == ["找不到 QQ 号 123456：不是空间成员，也不在本群成员列表里"]
+    assert plugin._store.list_members(1) == baseline_members
+    assert plugin._store.list_space_events(1) == baseline_events
+    admin_group_members.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_unknown_raw_id_removal_never_fetches_or_registers(
+    plugin, admin_group_members
+):
+    """Revoking a nonmember retains the existing error even for a group hit."""
+    target = UserRef(platform_id="qq", user_id="123456")
+    admin_group_members.return_value = [
+        GroupMember(target, "Group Card", ("Group Card",))
+    ]
+    await plugin.initialize()
+    await run(plugin, Comp.Plain(text="/todo list"), group=owner_group())
+    baseline_members = plugin._store.list_members(1)
+    baseline_events = plugin._store.list_space_events(1)
+
+    replies = await run(
+        plugin, Comp.Plain(text="/todo admin -123456"), group=owner_group()
+    )
+
+    assert replies == ["123456 还不是这个空间的成员"]
+    assert plugin._store.list_members(1) == baseline_members
+    assert plugin._store.list_space_events(1) == baseline_events
+    admin_group_members.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_multiple_unknown_raw_ids_fetch_group_once(
+    plugin, admin_group_members
+):
+    """One group listing supplies every unknown added ID in a command."""
+    targets = [
+        GroupMember(UserRef("qq", "123456"), "First Card", ("First Card",)),
+        GroupMember(UserRef("qq", "234567"), "Second Card", ("Second Card",)),
+    ]
+    admin_group_members.return_value = targets
+    await plugin.initialize()
+
+    replies = await run(
+        plugin, Comp.Plain(text="/todo admin +123456 +234567"), group=owner_group()
+    )
+
+    for target in targets:
+        member = plugin._store.get_member(1, target.user)
+        assert member is not None
+        assert member.role is SpaceRole.ADMIN
+        assert member.nickname == target.nickname
+        assert f"{target.nickname}：管理员" in replies[0]
+    events = plugin._store.list_space_events(1)[:2]
+    assert {event.detail["user"] for event in events} == {
+        target.user.key for target in targets
+    }
+    assert all(event.action is SpaceEventAction.ROLE for event in events)
+    admin_group_members.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_mention_only_registers_without_group_fetch(
+    plugin, admin_group_members
+):
+    """Explicit mentions retain their existing automatic registration behavior."""
+    await plugin.initialize()
+
+    replies = await run(
+        plugin,
+        Comp.Plain(text="/todo admin +"),
+        Comp.At(qq="123456", name="Mention Name"),
+        group=owner_group(),
+    )
+
+    target = UserRef(platform_id="qq", user_id="123456")
+    member = plugin._store.get_member(1, target)
+    assert member is not None
+    assert member.nickname == "Mention Name"
+    assert member.role is SpaceRole.ADMIN
+    assert "Mention Name：管理员" in replies[0]
+    admin_group_members.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_mixed_mentions_and_raw_ids_update_together(
+    plugin, admin_group_members
+):
+    """Promote mentioned and group-listed users while revoking another raw ID."""
+    await plugin.initialize()
+    await run(plugin, Comp.Plain(text="/todo list"), group=owner_group())
+    revoked = UserRef(platform_id="qq", user_id="345678")
+    with plugin._store.transaction():
+        plugin._store.upsert_member(1, revoked, "Former Admin")
+        plugin._store.set_member_role(1, revoked, SpaceRole.ADMIN)
+    raw = UserRef(platform_id="qq", user_id="234567")
+    mentioned = UserRef(platform_id="qq", user_id="123456")
+    admin_group_members.return_value = [GroupMember(raw, "Group Card", ("Group Card",))]
+
+    replies = await run(
+        plugin,
+        Comp.Plain(text="/todo admin +"),
+        Comp.At(qq=mentioned.user_id, name="Mention Name"),
+        Comp.Plain(text=" +234567 -345678"),
+        group=owner_group(),
+    )
+
+    for user, name, role in [
+        (mentioned, "Mention Name", SpaceRole.ADMIN),
+        (raw, "Group Card", SpaceRole.ADMIN),
+        (revoked, "Former Admin", SpaceRole.MEMBER),
+    ]:
+        member = plugin._store.get_member(1, user)
+        assert member.nickname == name
+        assert member.role is role
+        assert (
+            f"{name}：{'管理员' if role is SpaceRole.ADMIN else '成员'}" in replies[0]
+        )
+    events = plugin._store.list_space_events(1)[:3]
+    assert {event.detail["user"] for event in events} == {
+        mentioned.key,
+        raw.key,
+        revoked.key,
+    }
+    assert all(event.action is SpaceEventAction.ROLE for event in events)
+    admin_group_members.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_first", [True, False], ids=["raw-first", "mention-first"])
+async def test_admin_raw_id_with_same_explicit_mention_keeps_name_without_fetch(
+    plugin, admin_group_members, raw_first
+):
+    """Mention proof wins over duplicate raw IDs regardless of target order."""
+    await plugin.initialize()
+    mention = Comp.At(qq="123456", name="Mention Name")
+    components = (
+        [Comp.Plain(text="/todo admin +123456 +"), mention]
+        if raw_first
+        else [Comp.Plain(text="/todo admin +"), mention, Comp.Plain(text=" +123456")]
+    )
+
+    replies = await run(plugin, *components, group=owner_group())
+
+    target = UserRef(platform_id="qq", user_id="123456")
+    member = plugin._store.get_member(1, target)
+    assert member is not None
+    assert member.nickname == "Mention Name"
+    assert member.role is SpaceRole.ADMIN
+    assert replies[0].count("Mention Name：管理员") == 1
+    events = [
+        event
+        for event in plugin._store.list_space_events(1)
+        if event.action is SpaceEventAction.ROLE
+    ]
+    assert len(events) == 1
+    assert events[0].detail == {"user": target.key, "role": ["member", "admin"]}
+    admin_group_members.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_exists", [False, True], ids=["group-hit", "space-member"]
+)
+async def test_admin_second_unknown_raw_id_failure_rolls_back_every_target(
+    plugin, admin_group_members, first_exists
+):
+    """A later unresolved ID prevents both earlier registration and promotion."""
+    await plugin.initialize()
+    await run(plugin, Comp.Plain(text="/todo list"), group=owner_group())
+    first = UserRef(platform_id="qq", user_id="111111")
+    if first_exists:
+        with plugin._store.transaction():
+            plugin._store.upsert_member(1, first, "Saved Name")
+    admin_group_members.return_value = [
+        GroupMember(first, "Group Card", ("Group Card",))
+    ]
+    baseline_members = plugin._store.list_members(1)
+    baseline_events = plugin._store.list_space_events(1)
+
+    replies = await run(
+        plugin,
+        Comp.Plain(text="/todo admin +111111 +123456"),
+        group=owner_group(),
+    )
+
+    assert replies == ["找不到 QQ 号 123456：不是空间成员，也不在本群成员列表里"]
+    assert plugin._store.list_members(1) == baseline_members
+    assert plugin._store.list_space_events(1) == baseline_events
+    admin_group_members.assert_awaited_once()
 
 
 @pytest.mark.asyncio

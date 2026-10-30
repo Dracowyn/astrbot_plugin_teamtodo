@@ -298,13 +298,7 @@ class TodoService:
         return name
 
     def note_session_title(self, session: str, title: str) -> None:
-        """Remember the display title of a session for the WebUI (M3).
-
-        Called by ``main.py`` and the LLM tools on every use: the group name
-        in group chats, the sender's nickname in private chats. Blank titles
-        are ignored; writes only when the stored title differs. Never raises
-        ``TodoError``.
-        """
+        """Refresh a changed, nonblank session title for the WebUI."""
         if not title.strip():
             return
         with self._store.transaction():
@@ -509,10 +503,7 @@ class TodoService:
         nickname: str,
         space_name: str | None = None,
     ) -> list[Member]:
-        """Find members by exact casefolded nickname, ignoring outer whitespace.
-
-        Returns zero or more matches, never fuzzy matches, in the named bound
-        space or actor's current space. Used for LLM assignee resolution.
+        """Find exact casefolded nicknames in a bound or current space.
 
         Raises:
             TodoError: Unbound space name.
@@ -757,18 +748,22 @@ class TodoService:
             self._space_log(actor, space, SpaceEventAction.CLAIM, {})
             return claimed
 
+    def get_member(self, actor: Actor, auto_name: str, user: UserRef) -> Member | None:
+        """Read a member of the actor's current space by platform identity."""
+        with self._store.transaction():
+            space, _ = self._space(actor, auto_name, None)
+            return self._store.get_member(space.id, user)
+
     def set_admins(
         self, actor: Actor, auto_name: str, ops: AssignOps
     ) -> tuple[Space, list[Member]]:
-        """Appoint (+@x) or revoke (-@x) admins; every mention needs a sign.
-
-        Unknown +@ targets join before promotion; unknown -@ targets fail.
+        """Appoint or revoke admins; unknown additions join before promotion.
 
         Raises:
-            TodoError: Bad usage, denied permission, unknown -@ target, or owner.
+            TodoError: Bad usage, denied permission, unknown removal, or owner.
         """
         if ops.replace is not None:
-            raise TodoError("用法：/todo admin +@某人 或 /todo admin -@某人")
+            raise TodoError("用法：/todo admin +@某人 / -@某人 或 +QQ号 / -QQ号")
         with self._store.transaction():
             space, member = self._space(actor, auto_name, None)
             perms.require(

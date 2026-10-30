@@ -4,6 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
+from astrbot_plugin_teamtodo.core import parsing
 from astrbot_plugin_teamtodo.core.models import Mention, Priority, TodoError, UserRef
 from astrbot_plugin_teamtodo.core.parsing import (
     parse_assign,
@@ -288,3 +289,119 @@ def test_full_width_assign_sign_applies_only_to_the_next_mention():
 def test_full_width_assign_sign_does_not_allow_stray_text(text):
     with pytest.raises(TodoError):
         parse_assign([text, A])
+
+
+@pytest.mark.parametrize("sign", ["+", "＋", "-", "－"])
+@pytest.mark.parametrize("digits", ["12345", "12345678901234567890"])
+@pytest.mark.parametrize("spacing", ["", " ", "\t\n"])
+def test_admin_accepts_signed_ascii_ids_with_boundary_lengths(sign, digits, spacing):
+    ops, raw_additions = parsing.parse_admin([f"{sign}{spacing}{digits}"], "qq-main")
+    mention = Mention(user=UserRef("qq-main", digits), name="")
+
+    assert ops.replace is None
+    assert ops.add == ((mention,) if sign in ("+", "＋") else ())
+    assert ops.remove == ((mention,) if sign in ("-", "－") else ())
+    assert raw_additions == (frozenset({mention.user}) if ops.add else frozenset())
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "+1234",
+        "-1234",
+        "+123456789012345678901",
+        "－123456789012345678901",
+        "+１２３４５",
+        "+١٢٣٤٥",
+        "+1234５",
+        "12345",
+        "12345678901234567890",
+        "+12345 67890",
+        "+12345 text",
+        "+12345 -",
+        "+",
+        "－",
+        "++12345",
+        "+-12345",
+        "+12 345",
+        "@12345",
+        '"+12345"',
+        '"unfinished',
+    ],
+)
+def test_admin_rejects_invalid_ids_unsigned_targets_and_stray_text(text):
+    with pytest.raises(TodoError, match="用法"):
+        parsing.parse_admin([text], "qq-main")
+
+
+@pytest.mark.parametrize("parts", [[], [" \t"], [A], ["+", A, B], ["+", A, "+"]])
+def test_admin_requires_nonempty_targets_and_a_sign_for_every_mention(parts):
+    with pytest.raises(TodoError, match="用法"):
+        parsing.parse_admin(parts, "qq")
+
+
+def test_admin_mixes_raw_ids_and_mentions_with_split_text_components():
+    ops, raw_additions = parsing.parse_admin(
+        ["+12", "345 -", " 67890 ＋", "\t", A, " － ", B], "qq-main"
+    )
+    added = Mention(user=UserRef("qq-main", "12345"), name="")
+    removed = Mention(user=UserRef("qq-main", "67890"), name="")
+
+    assert ops.replace is None
+    assert ops.add == (added, A)
+    assert ops.remove == (removed, B)
+    assert raw_additions == frozenset({added.user})
+
+
+@pytest.mark.parametrize("mention_first", [False, True])
+def test_admin_plus_mention_proves_duplicate_raw_addition_and_preserves_name(
+    mention_first,
+):
+    mention = Mention(user=UserRef("qq", "12345"), name="甲")
+    parts = ["+", mention, " +12345"] if mention_first else ["+12345 +", mention]
+
+    ops, raw_additions = parsing.parse_admin(parts, "qq")
+
+    assert ops.add == (mention,)
+    assert ops.remove == ()
+    assert raw_additions == frozenset()
+
+
+def test_admin_removal_mention_does_not_prove_raw_addition():
+    mention = Mention(user=UserRef("qq", "12345"), name="甲")
+
+    ops, raw_additions = parsing.parse_admin(["+12345 -", mention], "qq")
+
+    assert tuple(item.user for item in ops.add) == (mention.user,)
+    assert ops.remove == (mention,)
+    assert raw_additions == frozenset({mention.user})
+
+
+def test_admin_deduplicates_both_directions_and_prefers_explicit_removal_name():
+    mention = Mention(user=UserRef("qq", "12345"), name="甲")
+
+    ops, raw_additions = parsing.parse_admin(
+        ["+67890 +67890 -12345 -", mention, " -12345"], "qq"
+    )
+
+    assert ops.add == (Mention(user=UserRef("qq", "67890"), name=""),)
+    assert ops.remove == (mention,)
+    assert raw_additions == frozenset({UserRef("qq", "67890")})
+
+
+def test_admin_duplicate_proof_is_scoped_to_the_platform_instance():
+    other_platform = Mention(user=UserRef("qq-other", "12345"), name="甲")
+
+    ops, raw_additions = parsing.parse_admin(["+12345 +", other_platform], "qq-main")
+
+    assert ops.add == (
+        Mention(user=UserRef("qq-main", "12345"), name=""),
+        other_platform,
+    )
+    assert raw_additions == frozenset({UserRef("qq-main", "12345")})
+
+
+@pytest.mark.parametrize("text", ["12345", "+12345", "－12345678901234567890"])
+def test_task_assign_still_rejects_raw_ids(text):
+    with pytest.raises(TodoError):
+        parse_assign([text])

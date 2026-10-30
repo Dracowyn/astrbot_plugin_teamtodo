@@ -18,6 +18,9 @@ by whitespace. Field tokens may appear anywhere after the task reference:
   Brackets ``【】`` and ``［］`` are equivalent to ``[]``; opening and closing
   forms may be mixed, e.g. ``[标签】`` or ``【-标签］``.
 - assignment: ``+@a -@b`` accepts equivalent signs ``＋@a －@b``.
+- admin: every target needs a sign; raw IDs are 5–20 ASCII digits and use
+  the current platform instance. Raw additions without a matching explicit
+  ``+@`` mention are returned separately for membership verification.
 - everything else, joined by single spaces, is the title
 - a title wrapped in straight or curly double quotes is taken literally
   (its words are not interpreted as fields)
@@ -34,7 +37,7 @@ import re
 from datetime import datetime
 
 from .dates import parse_due_tokens
-from .models import Mention, Priority, TodoError
+from .models import Mention, Priority, TodoError, UserRef
 
 Part = str | Mention
 
@@ -248,6 +251,75 @@ def parse_assign(parts: list[Part]) -> AssignOps:
         replace=None,
         add=_unique_mentions([mention for sign, mention in signed if sign != "-"]),
         remove=_unique_mentions([mention for sign, mention in signed if sign == "-"]),
+    )
+
+
+def parse_admin(
+    parts: list[Part], platform_id: str
+) -> tuple[AssignOps, frozenset[UserRef]]:
+    """Parse signed admin mentions and 5–20 digit ASCII platform user IDs.
+
+    Returns:
+        Delta operations and raw additions without an explicit ``+`` mention.
+
+    Raises:
+        TodoError: Empty arguments, unsigned targets, or malformed syntax.
+    """
+    usage = "用法：/todo admin +@成员 -@成员 或 +用户ID -用户ID（5–20 位数字）"
+    try:
+        tokens = iter(_field_tokens(parts))
+    except TodoError:
+        raise TodoError(usage) from None
+    additions: dict[str, Mention] = {}
+    removals: dict[str, Mention] = {}
+    raw_additions: dict[str, UserRef] = {}
+    mentioned_additions: set[str] = set()
+    for token in tokens:
+        if isinstance(token, Mention) or token[1]:
+            raise TodoError(usage)
+        match = re.fullmatch(r"([+＋－-])([0-9]{5,20})?", token[0])
+        if match is None:
+            raise TodoError(usage)
+        target = None
+        digits = match[2]
+        if digits is None:
+            target = next(tokens, None)
+            if not isinstance(target, Mention):
+                if (
+                    target is None
+                    or target[1]
+                    or not re.fullmatch(r"[0-9]{5,20}", target[0])
+                ):
+                    raise TodoError(usage)
+                digits = target[0]
+        mention = (
+            target
+            if isinstance(target, Mention)
+            else Mention(user=UserRef(platform_id, digits), name="")
+        )
+        key = mention.user.key
+        adding = match[1] in ("+", "＋")
+        destination = additions if adding else removals
+        if isinstance(target, Mention):
+            if key not in destination or not destination[key].name:
+                destination[key] = mention
+            if adding:
+                mentioned_additions.add(key)
+        else:
+            destination.setdefault(key, mention)
+            if adding:
+                raw_additions[key] = mention.user
+    if not additions and not removals:
+        raise TodoError(usage)
+    return (
+        AssignOps(
+            replace=None, add=tuple(additions.values()), remove=tuple(removals.values())
+        ),
+        frozenset(
+            user
+            for key, user in raw_additions.items()
+            if key not in mentioned_additions
+        ),
     )
 
 

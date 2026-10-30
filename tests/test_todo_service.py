@@ -1149,3 +1149,43 @@ def test_note_session_title_ignores_blank_and_updates_only_changes(
     )
     service.note_session_title(GROUP_A, "")
     assert store.get_session_titles([GROUP_A]) == {GROUP_A: "New name"}
+
+
+def test_admin_id_membership_lookup_uses_current_space_and_platform(
+    service, store, space
+):
+    target = user("123456")
+    with store.transaction():
+        original = store.upsert_member(space.id, target, "Known")
+    assert service.get_member(OWNER, AUTO, target) == original
+    assert service.get_member(OWNER, AUTO, UserRef("other", "123456")) is None
+    second = service.new_space(OWNER, "Second")
+    assert service.get_member(OWNER, AUTO, target) is None
+    assert store.get_member(second.id, target) is None
+
+
+def test_admin_member_id_preserves_nickname_and_role_logs(service, store, space):
+    target = user("123456")
+    with store.transaction():
+        store.upsert_member(space.id, target, "Known")
+    raw = Mention(target, "")
+    _, promoted = service.set_admins(OWNER, AUTO, AssignOps(None, (raw,), ()))
+    assert promoted[0].nickname == "Known"
+    assert promoted[0].role == SpaceRole.ADMIN
+    _, revoked = service.set_admins(OWNER, AUTO, AssignOps(None, (), (raw,)))
+    assert revoked[0].nickname == "Known"
+    assert revoked[0].role == SpaceRole.MEMBER
+    assert [event.detail for event in store.list_space_events(space.id)[:2]] == [
+        {"user": target.key, "role": ["admin", "member"]},
+        {"user": target.key, "role": ["member", "admin"]},
+    ]
+
+
+def test_admin_unknown_id_removal_preserves_members_and_logs(service, store, space):
+    baseline = store.list_space_events(space.id)
+    with pytest.raises(TodoError, match="123456 还不是这个空间的成员"):
+        service.set_admins(
+            OWNER, AUTO, AssignOps(None, (), (Mention(user("123456"), ""),))
+        )
+    assert store.get_member(space.id, user("123456")) is None
+    assert store.list_space_events(space.id) == baseline

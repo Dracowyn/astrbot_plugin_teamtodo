@@ -33,13 +33,16 @@ from astrbot.core.star.session_plugin_manager import SessionPluginManager
 
 from .core.models import (
     Actor,
+    Mention,
     SpaceRole,
     Task,
     TaskStatus,
     TodoError,
 )
 from .core.parsing import (
+    AssignOps,
     Part,
+    parse_admin,
     parse_assign,
     parse_task_fields,
     split_ref,
@@ -279,7 +282,12 @@ class TeamTodoPlugin(Star):
                 actor.is_private, info.group_name, str(event.get_group_id() or "")
             )
             args = strip_command(message_parts(event), ("todo",))
-            reply = self._dispatch(actor, auto_name, args)
+            sub, rest = split_word(args)
+            reply = (
+                await self._admin(event, actor, auto_name, rest)
+                if sub.casefold() == "admin"
+                else self._dispatch(actor, auto_name, args)
+            )
         except TodoError as exc:
             reply = str(exc)
         except Exception:
@@ -336,7 +344,6 @@ class TeamTodoPlugin(Star):
             "join": self._join,
             "leave": self._leave,
             "claim": self._claim,
-            "admin": self._admin,
         }.get(sub)
         if handler is None:
             return "未知命令。\n" + help_text()
@@ -480,10 +487,39 @@ class TeamTodoPlugin(Star):
         space = self._service.claim(actor, auto_name)
         return f"你已成为空间「{space.name}」的所有者"
 
-    def _admin(self, actor: Actor, auto_name: str, args: list[Part]) -> str:
-        space, members = self._service.set_admins(actor, auto_name, parse_assign(args))
+    async def _admin(
+        self, event: AstrMessageEvent, actor: Actor, auto_name: str, args: list[Part]
+    ) -> str:
+        """Resolve raw additions before the synchronous role-update transaction."""
+        ops, raw_additions = parse_admin(args, actor.user.platform_id)
+        group = None
+        fetched = False
+        additions = []
+        for mention in ops.add:
+            if (
+                mention.user in raw_additions
+                and self._service.get_member(actor, auto_name, mention.user) is None
+            ):
+                if not fetched and event.get_group_id():
+                    group = await group_members.from_event(event)
+                    fetched = True
+                match = next(
+                    (member for member in group or () if member.user == mention.user),
+                    None,
+                )
+                if match is None:
+                    raise TodoError(
+                        f"找不到 QQ 号 {mention.user.user_id}："
+                        "不是空间成员，也不在本群成员列表里"
+                    )
+                mention = Mention(user=match.user, name=match.nickname)
+            additions.append(mention)
+        space, members = self._service.set_admins(
+            actor, auto_name, AssignOps(None, tuple(additions), ops.remove)
+        )
         lines = [
-            f"{m.nickname}：{'管理员' if m.role == SpaceRole.ADMIN else '成员'}"
+            f"{m.nickname or m.user.user_id}："
+            f"{'管理员' if m.role == SpaceRole.ADMIN else '成员'}"
             for m in members
         ]
         return f"空间「{space.name}」角色已更新：\n" + "\n".join(lines)
