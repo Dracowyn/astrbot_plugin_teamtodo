@@ -4,6 +4,7 @@
 import { nextTick, onBeforeUnmount, onMounted, ref } from "../vue.js";
 import { STATUS_COLOR } from "../format.js";
 import Icon from "./icon.js";
+import Meter from "./meter.js";
 import Pill from "./pill.js";
 import TaskCard from "./card.js";
 
@@ -11,11 +12,12 @@ const prefersReducedMotion = () => window.matchMedia("(prefers-reduced-motion: r
 
 export default {
   name: "BoardColumn",
-  components: { Icon, Pill, TaskCard },
+  components: { Icon, Meter, Pill, TaskCard },
   props: {
     status: { type: String, required: true },
     label: { type: String, required: true },
     tasks: { type: Array, required: true },
+    total: { type: Number, default: 0 }, // tasks across all shown columns, for the share bar
     now: { type: Number, required: true },
     editable: { type: Boolean, default: false },
     addable: { type: Boolean, default: false },
@@ -62,8 +64,10 @@ export default {
       <header class="col-head">
         <h2 :id="'col-h-' + status" class="col-title"><Pill :color="STATUS_COLOR[status]" dot>{{ label }}</Pill></h2>
         <span class="col-count num" :aria-label="tasks.length + ' 项'">{{ tasks.length }}</span>
+        <span class="col-share num" aria-hidden="true">{{ total ? Math.round((tasks.length / total) * 100) : 0 }}%</span>
         <button v-if="addable" type="button" class="col-add" :aria-label="'在「' + label + '」中新建任务'" @click="$emit('add', status)"><Icon name="plus" /></button>
       </header>
+      <Meter :value="total ? tasks.length / total : 0" />
       <div class="col-body">
         <ul ref="list" class="cards" :data-status="status">
           <TaskCard v-for="task in tasks" :key="task.seq" :task="task" :now="now" :editable="editable"

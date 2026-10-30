@@ -2,8 +2,10 @@
 // components from the same directory; until then it runs on mock data (token from ?t=).
 import { computed, createApp, onBeforeUnmount, onMounted, ref } from "./vue.js";
 import { getPublicBoard } from "./api.js";
-import { STATUSES, formatRelative, initial, nowSeconds, setTimeZone, tagColor } from "./format.js";
+import { STATUSES, formatRelative, nowSeconds, setTimeZone, toneClass } from "./format.js";
 import KanbanBoard from "./components/board.js";
+import Meter from "./components/meter.js";
+import SpaceIcon from "./components/space-icon.js";
 import RefreshIndicator from "./components/refresh-indicator.js";
 
 const REFRESH_SECONDS = 30;
@@ -16,7 +18,7 @@ function readToken() {
 }
 
 const App = {
-  components: { KanbanBoard, RefreshIndicator },
+  components: { KanbanBoard, Meter, RefreshIndicator, SpaceIcon },
   setup() {
     const board = ref(null);
     const state = ref("loading"); // loading | ok | error
@@ -99,20 +101,20 @@ const App = {
 
     return {
       board, state, errorMessage, linkClosed, refreshFailed, refreshing, cycle, now, counts, total, activeColumn, boardWrap,
-      STATUSES, REFRESH_SECONDS, formatRelative, initial, tagColor, goToColumn, onBoardScroll, load,
+      STATUSES, REFRESH_SECONDS, formatRelative, toneClass, goToColumn, onBoardScroll, load,
     };
   },
   template: `
-    <div class="pub">
-      <div class="pub-cover" aria-hidden="true"></div>
+    <div class="pub" :class="board ? toneClass(board.space.name) : 'tone-7'">
+      <div class="cover" aria-hidden="true"></div>
       <header class="pub-head">
-        <span class="page-icon pub-icon" :class="'c-' + tagColor(board ? board.space.name : 'x')" aria-hidden="true">{{ board ? initial(board.space.name) : '·' }}</span>
-        <h1 class="pub-title">{{ board ? board.space.name : state === 'error' ? '无法打开看板' : '加载中…' }}</h1>
-        <p v-if="board" class="pub-meta">
-          <span class="num">共 {{ total }} 项</span>
-          <span class="num">进行中 {{ counts.doing }}</span>
-          <span class="num">已完成 {{ counts.done }}</span>
-          <span>更新于 <time class="num">{{ formatRelative(board.updated_at, now) }}</time></span>
+        <SpaceIcon :name="board ? board.space.name : ''" />
+        <h1 class="page-title">{{ board ? board.space.name : state === 'error' ? '无法打开看板' : '加载中…' }}</h1>
+        <p v-if="board" class="stats">
+          <span class="stat num">共 {{ total }} 项</span>
+          <span class="stat num">进行中 {{ counts.doing }}</span>
+          <span class="stat num">已完成 {{ counts.done }}<Meter :value="total ? counts.done / total : 0" /></span>
+          <span class="stat">更新于 <time class="num">{{ formatRelative(board.updated_at, now) }}</time></span>
         </p>
       </header>
 

@@ -9,20 +9,22 @@ export const STATUSES = [
 export const STATUS_LABEL = { todo: "待办", doing: "进行中", done: "已完成", archived: "已归档" };
 export const PRIORITY_LABEL = { high: "高", medium: "中", low: "低" };
 export const PRIORITY_RANK = { high: 0, medium: 1, low: 2 };
-export const STATUS_COLOR = { todo: "gray", doing: "blue", done: "green", archived: "brown" };
+export const STATUS_COLOR = { todo: "gray", doing: "yellow", done: "green", archived: "brown" };
 export const PRIORITY_COLOR = { high: "red", medium: "yellow", low: "gray" };
 export const ROLE_COLOR = { owner: "orange", admin: "blue", member: "gray" };
-// Red is reserved for priority 高 and overdue, so tags and avatars never use it.
+// Red is reserved for priority 高 and overdue, so avatars never use it.
 const NAME_COLORS = ["blue", "green", "purple", "orange", "pink", "brown", "yellow", "gray"];
+const TONE_COUNT = 8; // matches the .tone-0 ... .tone-7 classes in tokens.css
 
 function hashString(text) {
   let hash = 0;
   for (const char of String(text)) hash = (hash * 31 + char.codePointAt(0)) >>> 0;
   return hash;
 }
-/** Deterministic palette colour for a tag, avatar or space name. */
-export const tagColor = (name) => NAME_COLORS[hashString(name) % NAME_COLORS.length];
-export const avatarColor = tagColor;
+/** Deterministic palette colour for an avatar, picked from the person's name. */
+export const avatarColor = (name) => NAME_COLORS[hashString(name) % NAME_COLORS.length];
+/** CSS class of a space's tone (cover colour and icon tile). Derived from the name so the admin and public pages agree. */
+export const toneClass = (name) => `tone-${hashString(name) % TONE_COUNT}`;
 /** First visible character, upper-cased (used by avatars and page icons). */
 export const initial = (name) => [...String(name ?? "").trim()][0]?.toUpperCase() ?? "?";
 export const ROLE_LABEL = { owner: "所有者", admin: "管理员", member: "成员" };
@@ -93,6 +95,24 @@ export function formatDue(seconds, now = nowSeconds()) {
   if (diff === -1) return `昨天 ${time}`;
   const date = `${pad(p.month)}-${pad(p.day)}`;
   return p.year === today.year ? `${date} ${time}` : `${p.year}-${date} ${time}`;
+}
+
+/**
+ * Relative due label for the card chip. Open tasks read "已逾期 1 天", "今天 18:00", "2 天后 18:00"; `tone` is
+ * "overdue", "soon" (due within 24 hours) or "". Closed tasks fall back to the plain label with no tone.
+ */
+export function describeDue(seconds, now = nowSeconds(), { open = true, overdue = false } = {}) {
+  if (!open) return { text: formatDue(seconds, now), tone: "" };
+  if (overdue) {
+    const late = Math.max(0, now - seconds);
+    const text = late < 3600 ? "不到 1 小时" : late < 86400 ? `${Math.floor(late / 3600)} 小时` : `${Math.floor(late / 86400)} 天`;
+    return { text: `已逾期 ${text}`, tone: "overdue" };
+  }
+  const p = wallParts(seconds);
+  const diff = dayIndex(p) - dayIndex(wallParts(now));
+  const tone = seconds - now < 86400 ? "soon" : "";
+  if (diff >= 2 && diff <= 30) return { text: `${diff} 天后 ${pad(p.hour)}:${pad(p.minute)}`, tone };
+  return { text: formatDue(seconds, now), tone };
 }
 
 /** Day heading for grouped logs: 今天 / 昨天 / 10月28日 / 2025年12月3日. */

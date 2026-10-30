@@ -1,81 +1,122 @@
-/* Design tokens: a Notion-like system. Warm neutral surfaces, hairline dividers, one blue accent, and a muted
-   select/tag palette (soft background + dark text). Text roles: --text, --muted (secondary), --faint (icons,
-   placeholders). Secondary text is .7 alpha (not .65) so it stays above 4.5:1 on white. */
+/* Design tokens: a refined paper system. Warm-neutral surfaces separated by tone steps and hairlines, a near-black
+   primary, one cool accent that only marks focus / links / selection, and pale-tint-with-dark-text status colours.
+   Text roles: --text, --muted (secondary), --faint (icons, placeholders); both greys hold 4.5:1 on every surface
+   they sit on (ground, column, card, sidebar). Space cover and tile colours come from the .tone-N classes below. */
 
 :root {
-  --ground: #ffffff;
-  --surface: #ffffff;       /* side peek, dialog */
-  --sidebar: #f7f6f3;
-  --hover: rgba(55, 53, 47, 0.06);
-  --active: rgba(55, 53, 47, 0.1);
-  --rule: rgba(55, 53, 47, 0.09);
-  --control: rgba(55, 53, 47, 0.2);
-  --text: rgb(55, 53, 47);
-  --muted: rgba(55, 53, 47, 0.7);
-  --faint: rgba(55, 53, 47, 0.5);
-  --accent: #2383e2;         /* focus ring, selection, underline */
-  --accent-strong: #1a6fc9;  /* primary button: 5:1 with white */
-  --accent-soft: rgba(35, 131, 226, 0.1);
-  --on-accent: #ffffff;
-  --link: #0b6bcb;
-  --danger: #c9372c;
+  --ground: #f8f7f5;
+  --surface: #ffffff;       /* modal, popover, dialog */
+  --sidebar: #f1efec;
+  --col: #f1efec;           /* board column field */
   --card: #ffffff;
-  --card-hover: #f7f7f5;
-  --card-shadow: rgba(15, 15, 15, 0.1) 0 0 0 1px, rgba(15, 15, 15, 0.1) 0 2px 4px;
-  --float-shadow: rgba(15, 15, 15, 0.05) 0 0 0 1px, rgba(15, 15, 15, 0.1) 0 3px 6px, rgba(15, 15, 15, 0.2) 0 9px 24px;
-  --scrim: rgba(15, 15, 15, 0.35);
-  --cover: #efe9df;
+  --hover: rgba(38, 35, 31, 0.06);
+  --active: rgba(38, 35, 31, 0.1);
+  --rule: #e6e3de;
+  --control: #cfcbc4;
+  --text: #26231f;
+  --muted: #5b564f;
+  --faint: #6a655d;
+  --primary: #26231f;       /* near-black fill, inverted in dark */
+  --on-primary: #ffffff;
+  --accent: #2b5f9e;        /* focus ring, selection, switch, link */
+  --accent-soft: rgba(43, 95, 158, 0.12);
+  --link: #1f5a9e;
+  --danger: #b42318;
+  --bad-bg: #fbe3de;        --bad-fg: #9a2217;
+  --warn-bg: #fbeac0;       --warn-fg: #764700;
+  --card-lift: 0 8px 18px -10px rgba(38, 30, 20, 0.28), 0 1px 3px rgba(38, 30, 20, 0.07);
+  --float-shadow: 0 24px 64px -16px rgba(30, 24, 16, 0.4), 0 6px 16px rgba(30, 24, 16, 0.12);
+  --scrim: rgba(28, 24, 20, 0.42);
 
-  --radius: 4px;
-  --radius-sm: 3px;
-  --control-h: 30px;
-  --font: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --todo-bar: #8a847a;
+  --doing-bar: #bf7a00;
+  --done-bar: #3f8046;
+
+  /* space tones: HSL lightness steps shared by cover, tile and tile ink (dark theme overrides them) */
+  --cover-l: 91%;
+  --tile-l: 84%;
+  --tile-ink-l: 22%;
+  --tone-sat-k: 1;
+
+  --radius-lg: 16px;        /* board columns, modal */
+  --radius: 10px;           /* cards, popovers, panels */
+  --radius-sm: 7px;         /* controls, tags */
+  --pill: 999px;
+  --control-h: 32px;
+  --font: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
 
-  /* select / tag palette: --pb background, --pf text */
-  --gray-bg: #e3e2e0;   --gray-fg: #32302c;
-  --brown-bg: #eee0da;  --brown-fg: #442a1e;
-  --orange-bg: #fadec9; --orange-fg: #5c3b23;
-  --yellow-bg: #fdecc8; --yellow-fg: #402c1b;
-  --green-bg: #dbeddb;  --green-fg: #1c3829;
-  --blue-bg: #d3e5ef;   --blue-fg: #183347;
-  --purple-bg: #e8deee; --purple-fg: #412454;
-  --pink-bg: #f5e0e9;   --pink-fg: #4c2337;
-  --red-bg: #ffe2dd;    --red-fg: #5d1715;
+  /* select / tag / avatar palette: --pb background, --pf text */
+  --gray-bg: #e9e6e1;   --gray-fg: #3f3b36;
+  --brown-bg: #eadfd6;  --brown-fg: #4a2f1d;
+  --orange-bg: #fadfc8; --orange-fg: #6a3510;
+  --yellow-bg: #f8e6b8; --yellow-fg: #5c3b00;
+  --green-bg: #d8e8d6;  --green-fg: #20502b;
+  --blue-bg: #d6e4f2;   --blue-fg: #1c3f66;
+  --purple-bg: #e6dcef; --purple-fg: #45285c;
+  --pink-bg: #f4dce6;   --pink-fg: #5a2340;
+  --red-bg: #fbdcd6;    --red-fg: #84190f;
   color-scheme: light;
 }
 
 :root[data-theme="dark"] {
-  --ground: #191919;
-  --surface: #252525;
-  --sidebar: #202020;
-  --hover: rgba(255, 255, 255, 0.055);
-  --active: rgba(255, 255, 255, 0.1);
-  --rule: rgba(255, 255, 255, 0.094);
-  --control: rgba(255, 255, 255, 0.2);
-  --text: rgba(255, 255, 255, 0.81);
-  --muted: rgba(255, 255, 255, 0.6);
-  --faint: rgba(255, 255, 255, 0.46);
-  --accent: #2383e2;
-  --accent-strong: #1f78d1;
-  --accent-soft: rgba(35, 131, 226, 0.18);
-  --link: #5ba7f0;
-  --danger: #ff7369;
-  --card: #252525;
-  --card-hover: #2f2f2f;
-  --card-shadow: rgba(255, 255, 255, 0.094) 0 0 0 1px, rgba(0, 0, 0, 0.3) 0 2px 4px;
-  --float-shadow: rgba(255, 255, 255, 0.094) 0 0 0 1px, rgba(0, 0, 0, 0.3) 0 3px 6px, rgba(0, 0, 0, 0.5) 0 9px 24px;
-  --scrim: rgba(0, 0, 0, 0.6);
-  --cover: #2c2924;
+  --ground: #1b1917;
+  --surface: #2a2723;
+  --sidebar: #151311;
+  --col: #22201d;
+  --card: #2b2825;
+  --hover: rgba(240, 235, 227, 0.07);
+  --active: rgba(240, 235, 227, 0.12);
+  --rule: #38342f;
+  --control: #4d4841;
+  --text: #f0ebe3;
+  --muted: #b2ab9f;
+  --faint: #978f84;
+  --primary: #f0ebe3;
+  --on-primary: #1b1917;
+  --accent: #86b4ee;
+  --accent-soft: rgba(134, 180, 238, 0.16);
+  --link: #8dbaf2;
+  --danger: #ff8a7c;
+  --bad-bg: #4a2420;    --bad-fg: #ffa99c;
+  --warn-bg: #47381a;   --warn-fg: #f2c46a;
+  --card-lift: 0 10px 22px -10px rgba(0, 0, 0, 0.7), 0 1px 3px rgba(0, 0, 0, 0.4);
+  --float-shadow: 0 28px 70px -16px rgba(0, 0, 0, 0.75), 0 6px 18px rgba(0, 0, 0, 0.45);
+  --scrim: rgba(8, 6, 4, 0.66);
 
-  --gray-bg: #4f4f4f;   --gray-fg: #f0efed;
-  --brown-bg: #5a3828;  --brown-fg: #f0efed;
-  --orange-bg: #7a4519; --orange-fg: #f0efed;
-  --yellow-bg: #7a5a22; --yellow-fg: #f0efed;
-  --green-bg: #285038;  --green-fg: #f0efed;
-  --blue-bg: #264269;   --blue-fg: #f0efed;
-  --purple-bg: #452c5c; --purple-fg: #f0efed;
-  --pink-bg: #62304a;   --pink-fg: #f0efed;
-  --red-bg: #693229;    --red-fg: #f0efed;
+  --todo-bar: #7d766b;
+  --doing-bar: #d9a441;
+  --done-bar: #6fae73;
+
+  --cover-l: 23%;
+  --tile-l: 34%;
+  --tile-ink-l: 90%;
+  --tone-sat-k: 0.7;
+
+  --gray-bg: #46413b;   --gray-fg: #f3efe8;
+  --brown-bg: #5a3b2b;  --brown-fg: #f3efe8;
+  --orange-bg: #6f4220; --orange-fg: #f3efe8;
+  --yellow-bg: #6b5016; --yellow-fg: #f3efe8;
+  --green-bg: #2c4b33;  --green-fg: #f3efe8;
+  --blue-bg: #2b4565;   --blue-fg: #f3efe8;
+  --purple-bg: #4a3560; --purple-fg: #f3efe8;
+  --pink-bg: #62324a;   --pink-fg: #f3efe8;
+  --red-bg: #6b2d25;    --red-fg: #f3efe8;
   color-scheme: dark;
+}
+
+/* Space tone: a hue and saturation per tone; cover field and icon tile are derived, so both themes stay in step. */
+.tone-0 { --th: 14;  --ts: 52%; }
+.tone-1 { --th: 38;  --ts: 56%; }
+.tone-2 { --th: 92;  --ts: 32%; }
+.tone-3 { --th: 160; --ts: 32%; }
+.tone-4 { --th: 192; --ts: 40%; }
+.tone-5 { --th: 214; --ts: 44%; }
+.tone-6 { --th: 340; --ts: 40%; }
+.tone-7 { --th: 30;  --ts: 8%; }
+[class*="tone-"] {
+  --tone-s: calc(var(--ts) * var(--tone-sat-k));
+  --cover-bg: hsl(var(--th) var(--tone-s) var(--cover-l));
+  --tile-bg: hsl(var(--th) var(--tone-s) var(--tile-l));
+  --tile-ink: hsl(var(--th) calc(var(--tone-s) + 10%) var(--tile-ink-l));
 }

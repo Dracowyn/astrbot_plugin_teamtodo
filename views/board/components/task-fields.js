@@ -1,5 +1,5 @@
 // Task properties as Notion-style rows (line icon + gray label + value). Shared by the create panel (compact)
-// and the side peek (full: big title, status, extra read-only rows via the default slot, then the description).
+// and the task modal (full: big title, status, extra read-only rows via the default slot, then the description).
 // Edits a draft object in place (the parent owns it); see draft.js for its shape.
 import { computed, nextTick, ref } from "../vue.js";
 import { LIMITS, PRIORITY_COLOR, PRIORITY_LABEL, STATUS_COLOR, STATUSES, STATUS_LABEL } from "../format.js";
@@ -48,7 +48,7 @@ export default {
   },
   template: `
     <div class="fields">
-      <input v-if="full" :id="id + '-title'" v-model="draft.title" class="peek-title" type="text" :maxlength="LIMITS.title"
+      <input v-if="full" :id="id + '-title'" v-model="draft.title" class="modal-title" type="text" :maxlength="LIMITS.title"
              placeholder="无标题" aria-label="标题" required data-autofocus>
       <div class="props">
         <div v-if="full" class="prop">

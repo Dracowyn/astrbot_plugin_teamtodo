@@ -21,6 +21,7 @@ export default {
       const list = props.showArchived ? [...STATUSES, ARCHIVED_COLUMN] : STATUSES;
       return list.map((column) => ({ ...column, tasks: sortTasks(props.tasks.filter((t) => t.status === column.key), column.key) }));
     });
+    const total = computed(() => columns.value.reduce((sum, column) => sum + column.tasks.length, 0));
     const order = computed(() => columns.value.map((column) => column.key));
 
     /** A drop reports the target status; an Alt+Arrow keypress reports a step along the column order. */
@@ -31,12 +32,12 @@ export default {
       if (target && target !== task.status) emit("move", { seq, status: target });
     }
 
-    return { columns, onMove };
+    return { columns, total, onMove };
   },
   template: `
     <div class="board" :style="{ '--cols': columns.length }" role="group" aria-label="任务看板">
       <BoardColumn v-for="column in columns" :key="column.key" :status="column.key" :label="column.label"
-                   :tasks="column.tasks" :now="now" :editable="editable" :addable="editable && column.key !== 'archived'"
+                   :tasks="column.tasks" :total="total" :now="now" :editable="editable" :addable="editable && column.key !== 'archived'"
                    @open="$emit('open', $event)" @move="onMove" @add="$emit('add', $event)" />
     </div>
   `,

@@ -1,7 +1,7 @@
-// Tag editor: coloured tag pills with × and a text input (Enter or comma adds). Suggestions come from
+// Tag editor: neutral tag pills with × and a text input (Enter or comma adds). Suggestions come from
 // tags already used in the space. Limits mirror core/models.py.
 import { ref } from "../vue.js";
-import { LIMITS, tagColor } from "../format.js";
+import { LIMITS } from "../format.js";
 import Pill from "./pill.js";
 
 let uid = 0;
@@ -38,13 +38,13 @@ export default {
         add();
       }
     }
-    return { text, error, listId, add, remove, onKeydown, LIMITS, tagColor };
+    return { text, error, listId, add, remove, onKeydown, LIMITS };
   },
   template: `
     <div class="tag-input">
       <ul v-if="modelValue.length" class="tag-list" aria-label="已添加的标签">
         <li v-for="tag in modelValue" :key="tag">
-          <Pill :color="tagColor(tag)">{{ tag }}<button type="button" class="tag-remove" :aria-label="'移除标签 ' + tag" @click="remove(tag)">×</button></Pill>
+          <Pill color="gray">{{ tag }}<button type="button" class="tag-remove" :aria-label="'移除标签 ' + tag" @click="remove(tag)">×</button></Pill>
         </li>
       </ul>
       <input v-model="text" class="input input-flat" type="text" :list="listId" :maxlength="LIMITS.tag * 2" placeholder="输入标签，回车添加"
