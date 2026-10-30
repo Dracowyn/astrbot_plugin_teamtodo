@@ -502,8 +502,8 @@ class TodoService:
         auto_name: str,
         nickname: str,
         space_name: str | None = None,
-    ) -> list[Member]:
-        """Find exact casefolded nicknames in a bound or current space.
+    ) -> tuple[Space, list[Member]]:
+        """Find exact casefolded nicknames; also return the space searched.
 
         Raises:
             TodoError: Unbound space name.
@@ -511,12 +511,10 @@ class TodoService:
         key = nickname.strip().casefold()
         with self._store.transaction():
             space, _ = self._space(actor, auto_name, space_name)
-            if not key:
-                return []
-            return [
+            return space, [
                 member
                 for member in self._store.list_members(space.id)
-                if member.nickname.strip().casefold() == key
+                if key and member.nickname.strip().casefold() == key
             ]
 
     def delete_task(self, actor: Actor, auto_name: str, ref: TaskRef) -> TaskResult:

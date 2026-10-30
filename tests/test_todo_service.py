@@ -1030,12 +1030,14 @@ def test_find_members_matches_exact_nickname_ignoring_case(service, store, space
         store.upsert_member(space.id, user("b1"), "Bob")
         store.upsert_member(space.id, user("b2"), "bob")
         store.upsert_member(space.id, user("b3"), "Bobby")
+        store.upsert_member(space.id, user("b4"), "")
 
     # Act
-    found = service.find_members(MEMBER, AUTO, "  BOB ")
-    empty = service.find_members(MEMBER, AUTO, "   ")
+    searched, found = service.find_members(MEMBER, AUTO, "  BOB ")
+    _, empty = service.find_members(MEMBER, AUTO, "   ")
 
     # Assert
+    assert searched.id == space.id
     assert {m.user for m in found} == {user("b1"), user("b2")}
     assert empty == []
 

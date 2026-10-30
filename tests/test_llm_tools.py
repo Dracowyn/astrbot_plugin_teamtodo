@@ -11,6 +11,7 @@ from astrbot_plugin_teamtodo.core.models import (
     Mention,
     SpaceEventAction,
     SpaceRole,
+    TaskDraft,
     TaskStatus,
     UserRef,
 )
@@ -59,6 +60,13 @@ class FakeEvent:
         self.send_error = send_error
         self.sent = []
         self.unified_msg_origin = PRIVATE if private else GROUP
+        self.extras = {}
+
+    def get_extra(self, key, default=None):
+        return self.extras.get(key, default)
+
+    def set_extra(self, key, value):
+        self.extras[key] = value
 
     def get_messages(self):
         return self.components
@@ -707,7 +715,7 @@ async def test_group_lookup_cache_is_shared_by_update_remove_and_add(
 
 
 @pytest.mark.asyncio
-async def test_group_lookup_cache_is_not_shared_across_calls(tools, group_lookup):
+async def test_group_lookup_is_shared_by_calls_on_the_same_message(tools, group_lookup):
     event = FakeEvent()
     group_lookup["members"] = [GroupMember(user("g1"), "Card", ("Account",))]
 
@@ -718,10 +726,53 @@ async def test_group_lookup_cache_is_not_shared_across_calls(tools, group_lookup
     second = await call(
         tools, "teamtodo_add_task", event, title="second", assignees=["Account"]
     )
+    other_event = FakeEvent()
+    third = await call(
+        tools, "teamtodo_add_task", other_event, title="third", assignees=["Account"]
+    )
 
     assert data_of(first)["assignees"] == ["Card"]
-    assert data_of(second)["assignees"] == ["Other card"]
-    assert group_lookup["calls"] == [event, event]
+    assert data_of(second)["assignees"] == ["Card"]
+    assert data_of(third)["assignees"] == ["Other card"]
+    assert group_lookup["calls"] == [event, other_event]
+
+
+@pytest.mark.asyncio
+async def test_failed_group_lookup_is_cached_for_the_message(
+    tools, store, group_lookup
+):
+    space = await seed_space(tools, store)
+    with store.transaction():
+        store.set_space_owner(space.id, user("u1"))
+    event = FakeEvent()
+    group_lookup["members"] = None
+
+    added = await call(tools, "teamtodo_add_task", event, title="x", assignees=["Bob"])
+    group_lookup["members"] = [GroupMember(user("b1"), "Bob", ("Bob",))]
+    synced = await call(tools, "teamtodo_sync_members", event)
+
+    assert added == "Error: 空间成员里没有「Bob」，请让用户 @ 对方"
+    assert synced == "Error: 当前平台无法获取群成员列表"
+    assert group_lookup["calls"] == [event]
+    assert store.get_member(space.id, user("b1")) is None
+
+
+@pytest.mark.asyncio
+async def test_sync_and_assignment_share_one_fetch(tools, store, group_lookup):
+    space = await seed_space(tools, store)
+    with store.transaction():
+        store.set_space_owner(space.id, user("u1"))
+    event = FakeEvent()
+    group_lookup["members"] = [GroupMember(user("b1"), "Bob", ("Bob account",))]
+
+    synced = await call(tools, "teamtodo_sync_members", event)
+    added = await call(
+        tools, "teamtodo_add_task", event, title="x", assignees=["Bob account"]
+    )
+
+    assert data_of(synced)["added"] == 1
+    assert data_of(added)["assignees"] == ["Bob"]
+    assert group_lookup["calls"] == [event]
 
 
 @pytest.mark.asyncio
@@ -1278,3 +1329,156 @@ async def test_sync_rechecks_target_after_fetch(tools, store, monkeypatch, chang
             e.action != SpaceEventAction.SYNC
             for e in store.list_space_events(target.id)
         )
+
+
+def test_sync_description_limits_calls_to_explicit_requests(tools):
+    description = tools["teamtodo_sync_members"].description
+
+    assert "explicitly" in description
+    assert "@" in description
+
+
+@pytest.mark.asyncio
+async def test_sync_refused_when_plugin_stops_during_fetch(
+    tools, store, holder, monkeypatch
+):
+    space = await seed_space(tools, store)
+    with store.transaction():
+        store.set_space_owner(space.id, user("u1"))
+    before = store.list_members(space.id), store.list_space_events(space.id)
+
+    async def fetch(event):
+        holder["service"] = None
+        return [GroupMember(user("new-id"), "New", ("New",))]
+
+    monkeypatch.setattr(llm_tools.group_members, "from_event", fetch)
+    out = await call(tools, "teamtodo_sync_members")
+
+    assert out == f"Error: {llm_tools.NOT_READY}"
+    assert (store.list_members(space.id), store.list_space_events(space.id)) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool,field",
+    [
+        ("teamtodo_add_task", "assignees"),
+        ("teamtodo_update_task", "add_assignees"),
+        ("teamtodo_update_task", "remove_assignees"),
+    ],
+)
+async def test_resolution_refused_when_plugin_stops_during_fetch(
+    tools, store, service, holder, monkeypatch, tool, field
+):
+    space = await seed_space(tools, store)
+    await call(tools, "teamtodo_add_task", title="x")
+    before = store.list_members(space.id), store.get_task(space.id, 1)
+
+    def stopped(*args, **kwargs):
+        raise RuntimeError("the stopped service must not be used")
+
+    async def fetch(event):
+        holder["service"] = None
+        monkeypatch.setattr(service, "find_members", stopped)
+        return [GroupMember(user("new-id"), "New", ("New",))]
+
+    monkeypatch.setattr(llm_tools.group_members, "from_event", fetch)
+    names = ["New", "Later"]
+    if tool == "teamtodo_add_task":
+        kwargs = {"title": "y", "assignees": names}
+    else:
+        kwargs = {"number": 1, field: names}
+    out = await call(tools, tool, **kwargs)
+
+    assert out == f"Error: {llm_tools.NOT_READY}"
+    assert (store.list_members(space.id), store.get_task(space.id, 1)) == before
+    assert store.get_task(space.id, 2) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["teamtodo_add_task", "teamtodo_update_task"])
+@pytest.mark.parametrize("field", ["add_assignees", "remove_assignees"])
+@pytest.mark.parametrize("change", ["use", "default"])
+async def test_current_space_switch_during_fetch_keeps_original_target(
+    tools, store, monkeypatch, tool, field, change
+):
+    space = await seed_space(tools, store)
+    await call(tools, "teamtodo_add_task", title="x")
+    with store.transaction():
+        other = store.create_space("Other", None)
+        store.bind(GROUP, other.id)
+        store.create_task(
+            TaskDraft(
+                space_id=other.id,
+                title="o",
+                creator=user("u1"),
+                created_session=GROUP,
+            )
+        )
+
+    async def fetch(event):
+        with store.transaction():
+            if change == "use":
+                store.set_current(GROUP, user("u1"), other.id)
+            else:
+                store.set_session_default(GROUP, other.id)
+        return [GroupMember(user("new-id"), "New", ("New",))]
+
+    monkeypatch.setattr(llm_tools.group_members, "from_event", fetch)
+    if tool == "teamtodo_add_task":
+        kwargs = {"title": "y", "assignees": ["New"]}
+    else:
+        kwargs = {"number": 1, field: ["New"], "title": "renamed"}
+    out = await call(tools, tool, **kwargs)
+
+    if tool == "teamtodo_update_task" and field == "remove_assignees":
+        # Removing someone not assigned is a no-op for assignees only.
+        assert data_of(out)["title"] == "renamed"
+    else:
+        assert data_of(out)["assignees"] == ["New"]
+    assert data_of(out)["space"] == SPACE
+    assert store.get_task(other.id, 1).title == "o"
+    assert store.get_task(other.id, 2) is None
+    assert store.get_member(other.id, user("new-id")) is None
+    expected = "y" if tool == "teamtodo_add_task" else "renamed"
+    assert store.list_tasks(space.id, tuple(TaskStatus))[-1].title == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["teamtodo_add_task", "teamtodo_update_task"])
+async def test_target_unbound_during_fetch_fails_as_unbound(
+    tools, store, monkeypatch, tool
+):
+    space = await seed_space(tools, store)
+    await call(tools, "teamtodo_add_task", title="x")
+    with store.transaction():
+        other = store.create_space("Other", None)
+        store.bind(GROUP, other.id)
+        store.create_task(
+            TaskDraft(
+                space_id=other.id,
+                title="o",
+                creator=user("u1"),
+                created_session=GROUP,
+            )
+        )
+
+    async def fetch(event):
+        with store.transaction():
+            store.unbind(GROUP, space.id)
+            store.set_current(GROUP, user("u1"), other.id)
+        return [GroupMember(user("new-id"), "New", ("New",))]
+
+    monkeypatch.setattr(llm_tools.group_members, "from_event", fetch)
+    if tool == "teamtodo_add_task":
+        kwargs = {"title": "y", "assignees": ["New"]}
+    else:
+        kwargs = {"number": 1, "add_assignees": ["New"]}
+    out = await call(tools, tool, **kwargs)
+
+    assert out == f"Error: 本会话没有绑定名为「{SPACE}」的空间"
+    assert store.get_task(other.id, 1).assignees == ()
+    assert store.get_task(other.id, 2) is None
+    assert store.get_member(other.id, user("new-id")) is None
+    assert store.get_task(space.id, 1).assignees == ()
+    assert store.get_member(space.id, user("new-id")) is None

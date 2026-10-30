@@ -49,22 +49,25 @@ async def from_event(event: AstrMessageEvent) -> list[GroupMember] | None:
 
     Returns:
         The members (``UserRef.platform_id`` = ``event.get_platform_id()``),
-        or ``None`` for private chats, platforms that cannot list members,
-        and failed calls (logged as a warning, never raised).
+        or ``None`` for private chats, events without a bot account id (the
+        bot could not be excluded), platforms that cannot list members, and
+        failed calls (logged as a warning, never raised).
     """
     try:
         group_id = event.get_group_id()
         if not group_id:
             return None
         platform_id = event.get_platform_id()
-        self_id = str(event.get_self_id())
+        self_id = str(event.get_self_id() or "").strip()
+        if self_id in ("", "None"):
+            logger.warning("[teamtodo] No bot account id on the event; not listing")
+            return None
         if event.get_platform_name() == "aiocqhttp":
             group_id = str(group_id)
-            routing_params = {"self_id": self_id} if self_id else {}
             members = await event.bot.call_action(
                 "get_group_member_list",
                 group_id=int(group_id) if group_id.isdigit() else group_id,
-                **routing_params,
+                self_id=self_id,
             )
             return _onebot_members(members, platform_id, self_id)
         group = await event.get_group()

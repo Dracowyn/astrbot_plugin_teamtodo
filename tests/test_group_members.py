@@ -107,13 +107,26 @@ async def test_event_onebot_preserves_card_and_account_names_and_routes_bot():
 
 
 @pytest.mark.asyncio
-async def test_event_onebot_string_group_id_without_bot_route():
+async def test_event_onebot_string_group_id_is_passed_through():
     event = FakeEvent(group_id="plain-group", members=[{"user_id": 1}])
-    event.message_obj.self_id = ""
     assert await group_members.from_event(event) == [
         GroupMember(UserRef("qq-main", "1"), "", ())
     ]
-    assert event.bot.calls == [("get_group_member_list", {"group_id": "plain-group"})]
+    assert event.bot.calls == [
+        ("get_group_member_list", {"group_id": "plain-group", "self_id": "99"})
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", ["aiocqhttp", "generic"])
+@pytest.mark.parametrize("self_id", ["", None, "None", "  "])
+async def test_event_without_bot_id_does_not_list(platform, self_id, warnings):
+    group = Group("123", members=[MessageMember("1", "Alice")])
+    event = FakeEvent(platform=platform, members=[{"user_id": 1}], group=group)
+    event.message_obj.self_id = self_id
+    assert await group_members.from_event(event) is None
+    assert event.bot.calls == []
+    assert len(warnings) == 1
 
 
 @pytest.mark.asyncio

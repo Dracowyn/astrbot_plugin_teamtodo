@@ -79,6 +79,10 @@ NOT_ADDRESSED = (
     "message, so the request may come from someone else's message. Ask the "
     "user to @ the bot (or use the wake word) and repeat the request."
 )
+NOT_READY = "the TeamTodo plugin is not ready; try again later"
+GROUP_CACHE_KEY = "teamtodo_group_members"
+"""Event extra holding this message's group member list (``None`` included)."""
+_UNFETCHED = object()
 
 _SPACE = {
     "type": "string",
@@ -372,10 +376,13 @@ class TeamTodoToolkit:
             ),
             (
                 "teamtodo_sync_members",
-                "Register every member of the current group chat as a space member "
-                "so they can be assigned by name. Use when a name cannot be found "
-                "in a group chat, then retry the assignment. Only space admins, "
-                "the owner or AstrBot admins may use this. QQ group chats only.",
+                "Register every member of the current group chat as a space "
+                "member. Call it only when the user explicitly asks to sync or "
+                "import the group's members. Never call it to recover from a "
+                "name that could not be found (assignment already searches the "
+                "group's members); ask the user to @ the person instead. Only "
+                "space admins, the owner or AstrBot admins may use this. QQ "
+                "group chats only.",
                 SYNC_MEMBERS_SCHEMA,
                 True,
                 self.sync_members,
@@ -392,6 +399,31 @@ class TeamTodoToolkit:
             for name, description, parameters, writes, impl in specs
         ]
 
+    def _service(self) -> TodoService:
+        """Read the service now; ``terminate()`` may have run during an await.
+
+        Raises:
+            TodoError: The plugin is not ready (before init or after terminate).
+        """
+        service = self._get_service()
+        if service is None:
+            raise TodoError(NOT_READY)
+        return service
+
+    @staticmethod
+    async def _group_members(event: AstrMessageEvent) -> list[GroupMember] | None:
+        """Fetch the current group's members at most once per message.
+
+        The result, ``None`` included, is cached on the event so every tool
+        call handling the same message shares one platform request. AstrBot
+        runs the tool calls of one message sequentially.
+        """
+        members = event.get_extra(GROUP_CACHE_KEY, _UNFETCHED)
+        if members is _UNFETCHED:
+            members = await group_members.from_event(event)
+            event.set_extra(GROUP_CACHE_KEY, members)
+        return members
+
     async def _context(self, event: AstrMessageEvent) -> tuple[TodoService, Actor, str]:
         """Resolve the speaker and the service for one call.
 
@@ -402,10 +434,7 @@ class TeamTodoToolkit:
             TodoError: Plugin not ready, or no sender id on the event.
         """
         info = await self._resolver.resolve(event)
-        # Read the service after the await: terminate() may have run meanwhile.
-        service = self._get_service()
-        if service is None:
-            raise TodoError("the TeamTodo plugin is not ready; try again later")
+        service = self._service()
         actor = build_actor(event, info)
         # Session title for the WebUI (design 7); must never break the tool.
         title = (
@@ -421,8 +450,8 @@ class TeamTodoToolkit:
         )
         return service, actor, auto_name
 
-    @staticmethod
     async def _resolve(
+        self,
         service: TodoService,
         actor: Actor,
         auto_name: str,
@@ -430,16 +459,31 @@ class TeamTodoToolkit:
         names: Sequence[str],
         mentions: list[Mention],
         event: AstrMessageEvent,
-        group_cache: dict[str, list[GroupMember] | None],
-    ) -> tuple[Mention, ...]:
+    ) -> tuple[tuple[Mention, ...], str | None]:
         """Resolve names by mention, space member, then current group member.
 
         Matching ignores case and leading ``@``. Group lookup is lazy for any
-        space bound to this group; callers share ``group_cache`` across
-        resolutions in a single tool call.
+        space bound to this group and fetched once per message. The first
+        space member search pins the target before any fetch: an omitted
+        ``space`` becomes the concrete space searched, so a ``/todo use`` or
+        default change during the fetch cannot redirect the caller's write.
+
+        Args:
+            service: The service read after the caller's last await.
+            actor: The speaker.
+            auto_name: Base name for an auto-created space.
+            space: Target space name, or ``None`` for the current space.
+            names: Display names to resolve.
+            mentions: People @-mentioned in the message.
+            event: The current message event.
+
+        Returns:
+            The resolved mentions and the space name to write to (``space``
+            unchanged when no member search ran).
 
         Raises:
-            TodoError: A name is empty, matches nobody, or matches several.
+            TodoError: A name is empty, matches nobody or several, the space
+                is not bound, or the plugin stopped during the fetch.
         """
         resolved: dict[str, Mention] = {}
         for raw in names:
@@ -453,16 +497,17 @@ class TeamTodoToolkit:
                 if m.name.strip().lstrip("@").strip().casefold() == key
             }
             if not hits:
+                searched, found = service.find_members(actor, auto_name, name, space)
+                space = searched.name
                 hits = {
-                    m.user.key: Mention(user=m.user, name=m.nickname)
-                    for m in service.find_members(actor, auto_name, name, space)
+                    m.user.key: Mention(user=m.user, name=m.nickname) for m in found
                 }
             if not hits and event.get_group_id():
-                if "members" not in group_cache:
-                    group_cache["members"] = await group_members.from_event(event)
+                members = await self._group_members(event)
+                service = self._service()
                 hits = {
                     member.user.key: Mention(user=member.user, name=member.nickname)
-                    for member in group_cache["members"] or ()
+                    for member in members or ()
                     if any(
                         alias.strip().lstrip("@").strip().casefold() == key
                         for alias in member.names
@@ -475,7 +520,7 @@ class TeamTodoToolkit:
             if not hits:
                 raise TodoError(f"空间成员里没有「{name}」，请让用户 @ 对方")
             resolved.update(hits)
-        return tuple(resolved.values())
+        return tuple(resolved.values()), space
 
     async def add_task(
         self,
@@ -498,11 +543,13 @@ class TeamTodoToolkit:
             except (ValueError, OverflowError) as exc:
                 raise TodoError(INVALID_DUE) from exc
         mentions = [p for p in message_parts(event) if isinstance(p, Mention)]
+        resolved, space = await self._resolve(
+            service, actor, auto_name, space, assignees, mentions, event
+        )
+        service = self._service()
         fields = TaskFields(
             title=title.strip(),
-            mentions=await self._resolve(
-                service, actor, auto_name, space, assignees, mentions, event, {}
-            ),
+            mentions=resolved,
             due_at=due_at,
             clear_due=False,
             priority=Priority(priority) if priority else None,
@@ -613,17 +660,13 @@ class TeamTodoToolkit:
             except (ValueError, OverflowError) as exc:
                 raise TodoError(INVALID_DUE) from exc
         mentions = [p for p in message_parts(event) if isinstance(p, Mention)]
-        group_cache: dict[str, list[GroupMember] | None] = {}
-        removed = await self._resolve(
-            service,
-            actor,
-            auto_name,
-            space,
-            remove_assignees,
-            mentions,
-            event,
-            group_cache,
+        removed, space = await self._resolve(
+            service, actor, auto_name, space, remove_assignees, mentions, event
         )
+        added, space = await self._resolve(
+            self._service(), actor, auto_name, space, add_assignees, mentions, event
+        )
+        service = self._service()
         change = TaskUpdate(
             status=TaskStatus(status) if status else None,
             title=title.strip() if title is not None else None,
@@ -634,16 +677,7 @@ class TeamTodoToolkit:
             add_tags=_clean_tags(add_tags),
             remove_tags=_clean_tags(remove_tags),
             description=description,
-            add_assignees=await self._resolve(
-                service,
-                actor,
-                auto_name,
-                space,
-                add_assignees,
-                mentions,
-                event,
-                group_cache,
-            ),
+            add_assignees=added,
             remove_assignees=tuple(m.user for m in removed),
         )
         if change == TaskUpdate():
@@ -696,7 +730,8 @@ class TeamTodoToolkit:
         service.sync_precheck(actor, space)
         if not event.get_group_id():
             raise TodoError("只能在群聊里同步群成员")
-        members = await group_members.from_event(event)
+        members = await self._group_members(event)
+        service = self._service()
         if not members:
             raise TodoError("当前平台无法获取群成员列表")
         chosen, added, total = service.sync_members(actor, members, space)
