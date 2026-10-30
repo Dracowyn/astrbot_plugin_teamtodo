@@ -7,13 +7,15 @@ import pytest
 from astrbot_plugin_teamtodo.core.models import (
     EventAction,
     Priority,
+    SpaceEventAction,
+    SpaceEventDraft,
     SpaceRole,
     TaskDraft,
     TaskEventDraft,
     TaskStatus,
     UserRef,
 )
-from astrbot_plugin_teamtodo.core.store import Store
+from astrbot_plugin_teamtodo.core.store import Store, _migrate_v1
 
 OWNER = UserRef(platform_id="adapter:one", user_id="owner:1")
 OTHER = UserRef(platform_id="adapter", user_id="one:owner:1")
@@ -72,6 +74,8 @@ WRITE_OPERATIONS = [
     lambda db, s, t: db.update_task(t),
     lambda db, s, t: db.delete_task(s, t.seq),
     lambda db, s, t: db.add_event(event_draft(s)),
+    lambda db, s, t: db.add_space_event(SpaceEventDraft(s, SpaceEventAction.CLAIM, {})),
+    lambda db, s, t: db.set_session_title("session", "Title"),
     lambda db, s, t: db.set_invite(s, "hash", 200),
     lambda db, s, t: db.clear_invite(s),
 ]
@@ -468,7 +472,7 @@ def test_sqlite_configuration_persistence_and_schema_version(tmp_path):
     assert db._conn.isolation_level is None
     assert db._conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert db._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 2
     trace = []
     db._conn.set_trace_callback(trace.append)
     with db.transaction():
@@ -501,7 +505,7 @@ def test_sqlite_configuration_persistence_and_schema_version(tmp_path):
         assert db.list_bindings("session")[0].bound_at == 123
         with db.transaction():
             assert db.create_task(draft(space.id)).seq == 3
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 2
         assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
         with db.transaction(), pytest.raises(sqlite3.IntegrityError):
             db.create_task(draft(999))
@@ -586,3 +590,166 @@ def test_done_before_filters_and_orders_across_spaces(store):
         assert db.list_done_before(200) == expected
     assert db.list_done_before(200) == expected
     assert db.list_done_before(99) == []
+
+
+def test_session_titles_refresh_survive_unbind_and_rollback(store):
+    db, now = store
+    session = "session'中文"
+    assert db.get_session_titles([]) == {}
+    assert db.get_session_titles([session, "missing"]) == {}
+    with db.transaction():
+        space = db.create_space("space", None)
+        db.bind(session, space.id)
+        db.set_session_title(session, "群名'中文")
+        db.set_session_title("", "")
+        assert db.get_session_titles([session]) == {session: "群名'中文"}
+    assert (
+        db._conn.execute(
+            "SELECT updated_at FROM session_titles WHERE session=?", (session,)
+        ).fetchone()[0]
+        == 100
+    )
+    now[0] = 200
+    with db.transaction():
+        db.set_session_title(session, "New title")
+        db.unbind(session, space.id)
+    assert db.get_session_titles([session, session, "", "missing"]) == {
+        session: "New title",
+        "": "",
+    }
+    assert (
+        db._conn.execute(
+            "SELECT updated_at FROM session_titles WHERE session=?", (session,)
+        ).fetchone()[0]
+        == 200
+    )
+    now[0] = 300
+    with pytest.raises(ValueError):
+        with db.transaction():
+            db.set_session_title(session, "Rolled back")
+            db.set_session_title("new", "Rolled back")
+            raise ValueError
+    assert db.get_session_titles([session, "new"]) == {session: "New title"}
+    with db.transaction():
+        db.delete_space(space.id)
+    assert db.get_session_titles([session]) == {session: "New title"}
+
+
+def test_space_events_identity_json_order_limits_isolation_and_cascade(store):
+    db, now = store
+    detail = {"中文": [None, True, False, 2, 1.5, {"quote": "'"}]}
+    with db.transaction():
+        space = db.create_space("space", None)
+        other = db.create_space("other", None)
+        first = db.add_space_event(
+            SpaceEventDraft(
+                space.id, SpaceEventAction.CREATE, detail, actor=OWNER, session="s'"
+            )
+        )
+        second = db.add_space_event(
+            SpaceEventDraft(space.id, SpaceEventAction.ROLE, {}, actor=OTHER)
+        )
+        foreign = db.add_space_event(
+            SpaceEventDraft(other.id, SpaceEventAction.CLAIM, {})
+        )
+        now[0] = 50
+        older = db.add_space_event(
+            SpaceEventDraft(
+                space.id,
+                SpaceEventAction.RENAME,
+                {"name": ["old", "new"]},
+                actor_label="管理员",
+            )
+        )
+        assert db.list_space_events(space.id) == [second, first, older]
+    assert first.actor == OWNER and second.actor == OTHER
+    assert first.actor != second.actor
+    assert first.action is SpaceEventAction.CREATE
+    assert first.detail == detail and first.session == "s'"
+    assert first.created_at == 100 and first.actor_label == ""
+    assert older.actor is None and older.actor_label == "管理员"
+    assert older.session == "" and older.created_at == 50
+    assert db.list_space_events(space.id, limit=1) == [second]
+    assert db.list_space_events(space.id, limit=0) == []
+    assert db.list_space_events(999) == []
+    assert db.list_space_events(other.id) == [foreign]
+    with pytest.raises(ValueError):
+        with db.transaction():
+            db.add_space_event(SpaceEventDraft(space.id, SpaceEventAction.CLAIM, {}))
+            db.delete_space(other.id)
+            raise ValueError
+    assert db.list_space_events(space.id) == [second, first, older]
+    assert db.list_space_events(other.id) == [foreign]
+    with db.transaction(), pytest.raises(sqlite3.IntegrityError):
+        db.add_space_event(SpaceEventDraft(999, SpaceEventAction.CLAIM, {}))
+    with db.transaction():
+        db.delete_space(space.id)
+    assert db.list_space_events(space.id) == []
+    assert db.list_space_events(other.id) == [foreign]
+
+
+def test_v1_upgrade_preserves_existing_rows_and_adds_persistent_v2_tables(tmp_path):
+    path = tmp_path / "v1.sqlite3"
+    conn = sqlite3.connect(path)
+    _migrate_v1(conn)
+    conn.execute("PRAGMA user_version=1")
+    conn.execute("INSERT INTO spaces VALUES (1, 'legacy', NULL, NULL, 10, 7)")
+    conn.execute("INSERT INTO bindings VALUES ('legacy session', 1, 11)")
+    conn.execute(
+        "INSERT INTO events VALUES (1, 1, 6, 'create', '{}', NULL, NULL, '', '', 12)"
+    )
+    conn.commit()
+    conn.close()
+    db = Store(path, clock=lambda: 20)
+    try:
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.get_space(1).name == "legacy"
+        assert db.list_bindings("legacy session")[0].bound_at == 11
+        assert db.list_events(1)[0].task_seq == 6
+        assert db.get_session_titles(["legacy session"]) == {}
+        assert db.list_space_events(1) == []
+        with db.transaction():
+            assert db.create_task(draft(1)).seq == 7
+            db.set_session_title("legacy session", "Legacy title")
+            event = db.add_space_event(SpaceEventDraft(1, SpaceEventAction.CLAIM, {}))
+        indexes = db._conn.execute("PRAGMA index_list(space_events)").fetchall()
+        assert any(
+            [
+                (row[2], row[3])
+                for row in db._conn.execute(f'PRAGMA index_xinfo("{index[1]}")')
+                if row[5]
+            ]
+            == [("space_id", 0), ("created_at", 1), ("id", 1)]
+            for index in indexes
+        )
+    finally:
+        db.close()
+    db = Store(path)
+    try:
+        assert db.get_session_titles(["legacy session"]) == {
+            "legacy session": "Legacy title"
+        }
+        assert db.list_space_events(1) == [event]
+        assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        db.close()
+
+
+def test_get_invite_by_space_returns_expired_and_replaced_invites(store):
+    db, _ = store
+    assert db.get_invite(999) is None
+    with db.transaction():
+        first = db.create_space("first", None)
+        second = db.create_space("second", None)
+        assert db.get_invite(first.id) is None
+        expired = db.set_invite(first.id, "expired", 1)
+        other = db.set_invite(second.id, "other", 200)
+        assert db.get_invite(first.id) == expired
+    assert db.get_invite(first.id) == expired
+    assert db.get_invite(second.id) == other
+    with db.transaction():
+        replacement = db.set_invite(first.id, "replacement", 300)
+    assert db.get_invite(first.id) == replacement
+    with db.transaction():
+        db.clear_invite(first.id)
+    assert db.get_invite(first.id) is None

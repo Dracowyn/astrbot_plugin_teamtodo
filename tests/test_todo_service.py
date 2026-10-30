@@ -1026,3 +1026,105 @@ def test_find_members_requires_bound_space(service, space):
     # Act / Assert
     with pytest.raises(TodoError, match="没有绑定"):
         service.find_members(MEMBER, AUTO, "bob", "Elsewhere")
+
+
+def test_space_event_lifecycle_and_chat_identity(service, store, clock):
+    from astrbot_plugin_teamtodo.core.models import SpaceEventAction as Action
+
+    space = service.list_tasks(OWNER, AUTO).space
+    initial = list(reversed(store.list_space_events(space.id)))
+    assert [(e.action, e.detail) for e in initial] == [
+        (Action.CREATE, {"name": AUTO}),
+        (Action.BIND, {"session": GROUP_A}),
+    ]
+    service.rename_space(OWNER, AUTO, "Renamed")
+    _, code, invite = service.create_invite(OWNER, AUTO)
+    guest = actor("guest", GROUP_B, admin=True)
+    service.join_space(guest, code)
+    service.leave_space(guest, "Renamed")
+    events = list(reversed(store.list_space_events(space.id)))
+    assert [(e.action, e.detail) for e in events[2:]] == [
+        (Action.RENAME, {"name": [AUTO, "Renamed"]}),
+        (Action.INVITE, {"expires_at": invite.expires_at}),
+        (Action.BIND, {"session": GROUP_B}),
+        (Action.UNBIND, {"session": GROUP_B}),
+    ]
+    assert all(e.actor == OWNER.user and e.session == GROUP_A for e in events[:4])
+    assert all(e.actor == guest.user and e.session == GROUP_B for e in events[4:])
+    assert all(e.actor_label == "" and e.created_at == clock.now for e in events)
+
+
+def test_explicit_space_logs_create_then_bind(service, store):
+    from astrbot_plugin_teamtodo.core.models import SpaceEventAction as Action
+
+    space = service.new_space(OWNER, "Explicit")
+    events = list(reversed(store.list_space_events(space.id)))
+    assert [(e.action, e.detail, e.actor, e.session) for e in events] == [
+        (Action.CREATE, {"name": "Explicit"}, OWNER.user, GROUP_A),
+        (Action.BIND, {"session": GROUP_A}, OWNER.user, GROUP_A),
+    ]
+
+
+def test_claim_and_actual_role_changes_only_are_logged(service, store):
+    from astrbot_plugin_teamtodo.core.models import SpaceEventAction as Action
+
+    space = service.list_tasks(MEMBER, AUTO).space
+    service.claim(OWNER, AUTO)
+    service.set_admins(
+        OWNER, AUTO, AssignOps(replace=None, add=(mention("member"),), remove=())
+    )
+    service.set_admins(
+        OWNER, AUTO, AssignOps(replace=None, add=(mention("member"),), remove=())
+    )
+    service.set_admins(
+        OWNER, AUTO, AssignOps(replace=None, add=(), remove=(mention("member"),))
+    )
+    events = list(reversed(store.list_space_events(space.id)))
+    assert [(e.action, e.detail) for e in events[2:]] == [
+        (Action.CLAIM, {}),
+        (Action.ROLE, {"user": MEMBER.user.key, "role": ["member", "admin"]}),
+        (Action.ROLE, {"user": MEMBER.user.key, "role": ["admin", "member"]}),
+    ]
+    assert all(e.actor == OWNER.user and e.session == GROUP_A for e in events[2:])
+
+
+def test_failed_space_changes_roll_back_log_and_state(service, store, space):
+    baseline = store.list_space_events(space.id)
+    with pytest.raises(TodoError):
+        service.set_admins(
+            OWNER,
+            AUTO,
+            AssignOps(
+                replace=None, add=(mention("member"), mention("unknown")), remove=()
+            ),
+        )
+    assert store.get_member(space.id, MEMBER.user).role == SpaceRole.MEMBER
+    assert store.list_space_events(space.id) == baseline
+    with pytest.raises(TodoError):
+        service.rename_space(MEMBER, AUTO, "Denied")
+    assert store.get_space(space.id).name == AUTO
+    assert store.list_space_events(space.id) == baseline
+
+
+def test_note_session_title_ignores_blank_and_updates_only_changes(
+    service, store, clock
+):
+    service.note_session_title(GROUP_A, " \n ")
+    assert store.get_session_titles([GROUP_A]) == {}
+    service.note_session_title(GROUP_A, "Team name")
+    clock.now += 10
+    service.note_session_title(GROUP_A, "Team name")
+    row = store._conn.execute(
+        "SELECT title, updated_at FROM session_titles WHERE session=?", (GROUP_A,)
+    ).fetchone()
+    assert tuple(row) == ("Team name", clock.now - 10)
+    service.note_session_title(GROUP_A, "New name")
+    assert store.get_session_titles([GROUP_A]) == {GROUP_A: "New name"}
+    assert (
+        store._conn.execute(
+            "SELECT updated_at FROM session_titles WHERE session=?", (GROUP_A,)
+        ).fetchone()[0]
+        == clock.now
+    )
+    service.note_session_title(GROUP_A, "")
+    assert store.get_session_titles([GROUP_A]) == {GROUP_A: "New name"}

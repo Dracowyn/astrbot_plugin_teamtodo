@@ -12,14 +12,27 @@ CONTRACT (signatures and behaviour fixed by the main loop):
   are rendered as-is in ``task_detail`` and omitted in one-line views.
 - Long lists are truncated to ``limit`` task lines with a trailing
   ``…还有 N 条`` line.
+- Event summaries cover task and space logs; malformed details fall back to
+  the action name, and description contents are never exposed.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, tzinfo
+from math import isfinite
 
-from ..core.models import Priority, Space, SpaceEvent, Task, TaskEvent, TaskStatus
+from ..core.models import (
+    EventAction,
+    Priority,
+    Space,
+    SpaceEvent,
+    SpaceEventAction,
+    SpaceRole,
+    Task,
+    TaskEvent,
+    TaskStatus,
+)
 
 _STATUS_LABELS = {
     TaskStatus.TODO: "待办",
@@ -86,6 +99,35 @@ def reminder_text(task: Task, space_name: str, now: float, tz: tzinfo) -> str:
     return f"⏰ {space_name}#{task.seq} {task.title} {timing}"
 
 
+def _event_pair(value: object) -> tuple[object, object]:
+    """Read an old/new pair without accepting strings or malformed sequences."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError("Invalid event pair")
+    return value[0], value[1]
+
+
+def _event_user(key: object, nicknames: Mapping[str, str]) -> str:
+    """Render a logged user key, preserving colons inside the user id."""
+    if not isinstance(key, str):
+        raise ValueError("Invalid event user")
+    platform, separator, user_id = key.partition(":")
+    if not platform or not separator or not user_id:
+        raise ValueError("Invalid event user")
+    return f"@{nicknames.get(key) or user_id}"
+
+
+def _event_time(value: object, now: object, tz: tzinfo) -> str:
+    """Format only finite numeric timestamps relative to the event time."""
+    for timestamp in (value, now):
+        if (
+            not isinstance(timestamp, (int, float))
+            or isinstance(timestamp, bool)
+            or not isfinite(timestamp)
+        ):
+            raise ValueError("Invalid event timestamp")
+    return format_due(value, now, tz)
+
+
 def event_summary(
     event: TaskEvent | SpaceEvent, nicknames: Mapping[str, str], tz: tzinfo
 ) -> str:
@@ -104,7 +146,119 @@ def event_summary(
     ``@李四：成员 → 管理员``, ``重置邀请码，有效期至 11-06 18:00``.
     Description texts are never included (they may be long).
     """
-    raise NotImplementedError
+    fallback = str(event.action)
+    detail = event.detail
+    if not isinstance(detail, dict):
+        return fallback
+    try:
+        if isinstance(event, TaskEvent):
+            reference = f"#{event.task_seq}"
+            if event.action == EventAction.CREATE:
+                title = detail["title"]
+                if isinstance(title, str):
+                    return f"创建任务 {reference}「{title}」"
+            elif event.action == EventAction.DELETE:
+                snapshot = detail["snapshot"]
+                if isinstance(snapshot, dict) and isinstance(
+                    snapshot.get("title"), str
+                ):
+                    return f"删除任务 {reference}「{snapshot['title']}」"
+            elif event.action == EventAction.UPDATE:
+                labels = {
+                    "title": "标题",
+                    "due_at": "截止时间",
+                    "priority": "优先级",
+                    "tags": "标签",
+                    "description": "描述",
+                }
+                if not detail or any(field not in labels for field in detail):
+                    return fallback
+                changed = []
+                for field, label in labels.items():
+                    if field not in detail:
+                        continue
+                    for value in _event_pair(detail[field]):
+                        if field in ("title", "description"):
+                            if not isinstance(value, str):
+                                return fallback
+                        elif field == "due_at":
+                            if value is not None:
+                                _event_time(value, event.created_at, tz)
+                        elif field == "priority":
+                            if value is not None and (
+                                not isinstance(value, str)
+                                or value not in _PRIORITY_LABELS
+                            ):
+                                return fallback
+                        elif not isinstance(value, (list, tuple)) or not all(
+                            isinstance(tag, str) for tag in value
+                        ):
+                            return fallback
+                    changed.append(label)
+                return f"修改 {reference}：{'、'.join(changed)}"
+            elif event.action == EventAction.ASSIGN:
+                names = []
+                for users in _event_pair(detail["assignees"]):
+                    if not isinstance(users, (list, tuple)):
+                        return fallback
+                    names.append(
+                        " ".join(_event_user(user, nicknames) for user in users) or "无"
+                    )
+                return f"{reference} 负责人：{names[0]} → {names[1]}"
+            elif event.action in (EventAction.STATUS, EventAction.ARCHIVE):
+                statuses = None
+                if "status" in detail:
+                    statuses = _event_pair(detail["status"])
+                    if any(
+                        not isinstance(status, str) or status not in _STATUS_LABELS
+                        for status in statuses
+                    ):
+                        return fallback
+                if event.action == EventAction.STATUS:
+                    if statuses is not None:
+                        old, new = (_STATUS_LABELS[status] for status in statuses)
+                        return f"{reference} 状态：{old} → {new}"
+                else:
+                    auto = detail.get("auto", False)
+                    if not isinstance(auto, bool):
+                        return fallback
+                    if statuses is not None and statuses[1] != TaskStatus.ARCHIVED:
+                        return fallback
+                    if statuses is not None or auto:
+                        return f"{reference} {'自动归档' if auto else '归档'}"
+        elif event.action == SpaceEventAction.CREATE:
+            name = detail["name"]
+            if isinstance(name, str):
+                return f"创建空间「{name}」"
+        elif event.action == SpaceEventAction.RENAME:
+            old, new = _event_pair(detail["name"])
+            if isinstance(old, str) and isinstance(new, str):
+                return f"空间改名：{old} → {new}"
+        elif event.action in (SpaceEventAction.BIND, SpaceEventAction.UNBIND):
+            session = detail["session"]
+            if isinstance(session, str):
+                label = (
+                    "绑定会话" if event.action == SpaceEventAction.BIND else "解绑会话"
+                )
+                return f"{label}：{session}"
+        elif event.action == SpaceEventAction.CLAIM:
+            return "认领空间"
+        elif event.action == SpaceEventAction.ROLE:
+            labels = {
+                SpaceRole.OWNER: "所有者",
+                SpaceRole.ADMIN: "管理员",
+                SpaceRole.MEMBER: "成员",
+            }
+            old, new = _event_pair(detail["role"])
+            if all(isinstance(role, str) and role in labels for role in (old, new)):
+                user = _event_user(detail["user"], nicknames)
+                return f"{user}：{labels[old]} → {labels[new]}"
+        elif event.action == SpaceEventAction.INVITE:
+            expires = _event_time(detail["expires_at"], event.created_at, tz)
+            return f"重置邀请码，有效期至 {expires}"
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return fallback
+    return fallback
 
 
 def event_actor_name(
@@ -112,7 +266,9 @@ def event_actor_name(
 ) -> str:
     """Who did it: member nickname (``user_id`` fallback) for chat users,
     ``actor_label`` for WebUI users, ``系统`` for automatic actions (M3)."""
-    raise NotImplementedError
+    if event.actor is not None:
+        return nicknames.get(event.actor.key) or event.actor.user_id
+    return event.actor_label or "系统"
 
 
 def task_detail(

@@ -22,12 +22,7 @@ from datetime import datetime, tzinfo
 
 from ..core import permissions as perms
 from ..core.models import (
-    MAX_ASSIGNEES,
-    MAX_DESCRIPTION_CHARS,
     MAX_SPACE_NAME_CHARS,
-    MAX_TAG_CHARS,
-    MAX_TAGS,
-    MAX_TITLE_CHARS,
     Actor,
     EventAction,
     Invite,
@@ -35,16 +30,18 @@ from ..core.models import (
     Mention,
     Priority,
     Space,
+    SpaceEventAction,
+    SpaceEventDraft,
     SpaceRole,
     Task,
     TaskDraft,
-    TaskEventDraft,
     TaskStatus,
     TodoError,
     UserRef,
 )
 from ..core.parsing import AssignOps, TaskFields, TaskRef
 from ..core.store import Store
+from . import task_ops
 from .access import (
     ConfirmationCodes,
     JoinRateLimiter,
@@ -61,17 +58,10 @@ _NAME_BREAKERS = re.compile(r"[\s#＃]+")
 
 
 def auto_space_name(is_private: bool, group_name: str | None, group_id: str) -> str:
-    """Base name for a session's auto-created space (design 2.1).
+    """Return the sanitized auto-space base name (design 2.1).
 
-    Args:
-        is_private: Whether the session is a private chat.
-        group_name: Group name from the platform, if known.
-        group_id: Group id, used when the name is unknown.
-
-    Returns:
-        ``我的任务`` for private chats, otherwise the group name, or
-        ``群<last 4 digits of the group id>``. Whitespace and ``#`` are removed
-        so the name stays usable in commands; length is capped on creation.
+    Private chats use 我的任务. Groups use group_name or 群<last 4 digits>.
+    Whitespace and # are removed; creation caps the final name's length.
     """
     if is_private:
         return PRIVATE_SPACE_NAME
@@ -181,6 +171,8 @@ class TodoService:
         space = self._store.create_space(self._unique_name(session, auto_name), owner)
         self._store.bind(session, space.id)
         self._store.set_session_default(session, space.id)
+        self._space_log(actor, space, SpaceEventAction.CREATE, {"name": space.name})
+        self._space_log(actor, space, SpaceEventAction.BIND, {"session": session})
         return space
 
     def _space(
@@ -233,10 +225,22 @@ class TodoService:
         }
 
     def _log(self, actor: Actor, task: Task, action: EventAction, detail: dict) -> None:
-        self._store.add_event(
-            TaskEventDraft(
-                space_id=task.space_id,
-                task_seq=task.seq,
+        task_ops.log_event(
+            self._store,
+            task,
+            action,
+            detail,
+            actor=actor.user,
+            actor_label="",
+            session=actor.session,
+        )
+
+    def _space_log(
+        self, actor: Actor, space: Space, action: SpaceEventAction, detail: dict
+    ) -> None:
+        self._store.add_space_event(
+            SpaceEventDraft(
+                space_id=space.id,
                 action=action,
                 detail=detail,
                 actor=actor.user,
@@ -247,107 +251,39 @@ class TodoService:
     def _apply(
         self, actor: Actor, space: Space, member: Member, task: Task, change: TaskUpdate
     ) -> Task | None:
-        """Check permission, apply ``change`` to ``task`` and log it.
-
-        Runs inside the caller's transaction. Status follows ``set_status``
-        (DONE sets ``done_at`` to now, ARCHIVED keeps it, TODO/DOING clear it);
-        a new ``due_at`` resets ``reminded``. One event is logged per kind of
-        change, in the formats of the single-purpose operations: UPDATE for
-        fields, ASSIGN for assignees, STATUS or ARCHIVE for the status.
-
-        Returns:
-            The saved task, or ``None`` when nothing changed (nothing is
-            written then, except that added assignees still become members).
-
-        Raises:
-            TodoError: Permission denied or a violated limit.
-        """
+        """Check edit permission and translate chat changes into shared rules."""
         perms.require(perms.can_edit_task(actor, member, task), perms.Op.EDIT_TASK)
-        if change.clear_due:
-            due_at = None
-        else:
-            due_at = task.due_at if change.due_at is None else change.due_at
-        if change.clear_priority:
-            priority = None
-        else:
-            priority = change.priority or task.priority
+        due_at = task.due_at if change.due_at is None else change.due_at
         tags = dict.fromkeys((*task.tags, *change.add_tags))
-        merged = dict.fromkeys(
+        assignees = dict.fromkeys(
             (*task.assignees, *(m.user for m in change.add_assignees))
         )
         updated = dcs.replace(
             task,
             title=task.title if change.title is None else change.title,
-            due_at=due_at,
-            priority=priority,
+            due_at=None if change.clear_due else due_at,
+            priority=None
+            if change.clear_priority
+            else change.priority or task.priority,
             tags=tuple(tag for tag in tags if tag not in change.remove_tags),
-            description=(
-                task.description
-                if change.description is None
-                else change.description.strip()
-            ),
+            description=task.description
+            if change.description is None
+            else change.description.strip(),
             assignees=tuple(
-                user for user in merged if user not in change.remove_assignees
+                user for user in assignees if user not in change.remove_assignees
             ),
+            status=change.status or task.status,
         )
-        fields = {
-            name: [getattr(task, name), getattr(updated, name)]
-            for name in ("title", "due_at", "priority", "tags", "description")
-            if getattr(task, name) != getattr(updated, name)
-        }
-        assignees_changed = updated.assignees != task.assignees
-        if fields or assignees_changed:
-            self._check_task(updated)
-        for mention in change.add_assignees:
-            self._store.upsert_member(space.id, mention.user, mention.name)
-        status = change.status or task.status
-        if status != task.status:
-            if status == TaskStatus.DONE:
-                done_at = self._clock()
-            elif status == TaskStatus.ARCHIVED:
-                done_at = task.done_at
-            else:
-                done_at = None
-            updated = dcs.replace(updated, status=status, done_at=done_at)
-        elif not fields and not assignees_changed:
-            return None
-        if "due_at" in fields:
-            updated = dcs.replace(updated, reminded=False)
-        saved = self._store.update_task(updated)
-        if fields:
-            self._log(actor, saved, EventAction.UPDATE, fields)
-        if assignees_changed:
-            detail = {
-                "assignees": [
-                    [user.key for user in task.assignees],
-                    [user.key for user in saved.assignees],
-                ]
-            }
-            self._log(actor, saved, EventAction.ASSIGN, detail)
-        if status != task.status:
-            action = (
-                EventAction.ARCHIVE
-                if status == TaskStatus.ARCHIVED
-                else EventAction.STATUS
-            )
-            self._log(actor, saved, action, {"status": [task.status, status]})
-        return saved
-
-    @staticmethod
-    def _check_task(task: Task | TaskDraft) -> None:
-        """Enforce the ``core.models`` limits on a task about to be written."""
-        if not task.title.strip():
-            raise TodoError("任务标题不能为空")
-        if len(task.title) > MAX_TITLE_CHARS:
-            raise TodoError(f"任务标题不能超过 {MAX_TITLE_CHARS} 字")
-        if len(task.description) > MAX_DESCRIPTION_CHARS:
-            raise TodoError(f"描述不能超过 {MAX_DESCRIPTION_CHARS} 字")
-        if len(task.tags) > MAX_TAGS:
-            raise TodoError(f"标签不能超过 {MAX_TAGS} 个")
-        if any(len(tag) > MAX_TAG_CHARS for tag in task.tags):
-            raise TodoError(f"单个标签不能超过 {MAX_TAG_CHARS} 字")
-        if len(task.assignees) > MAX_ASSIGNEES:
-            raise TodoError(f"负责人不能超过 {MAX_ASSIGNEES} 人")
+        return task_ops.apply(
+            self._store,
+            self._clock,
+            task,
+            updated,
+            actor=actor.user,
+            actor_label="",
+            session=actor.session,
+            added_assignees=change.add_assignees,
+        )
 
     @staticmethod
     def _check_space_name(name: str) -> str:
@@ -369,7 +305,11 @@ class TodoService:
         are ignored; writes only when the stored title differs. Never raises
         ``TodoError``.
         """
-        raise NotImplementedError
+        if not title.strip():
+            return
+        with self._store.transaction():
+            if self._store.get_session_titles([session]).get(session) != title:
+                self._store.set_session_title(session, title)
 
     # ----- tasks -----
 
@@ -381,20 +321,13 @@ class TodoService:
         space_name: str | None = None,
         description: str = "",
     ) -> TaskResult:
-        """Create a task; mentioned users become members and assignees.
+        """Create a task in the named bound space or the actor's current space.
 
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-            fields: Parsed fields; removal and clear flags are ignored.
-            space_name: Bound space to use instead of the current one.
-            description: Initial Markdown description (stripped).
-
-        Returns:
-            The created task; every assignee counts as added.
+        Mentions become members and assignees; removal/clear flags are ignored.
+        Description is stripped. Returns all assignees as added.
 
         Raises:
-            TodoError: Unbound space name or a violated limit.
+            TodoError: Unbound space or a violated task limit.
         """
         with self._store.transaction():
             space, _ = self._space(actor, auto_name, space_name)
@@ -409,7 +342,7 @@ class TodoService:
                 priority=fields.priority,
                 description=description.strip(),
             )
-            self._check_task(draft)
+            task_ops.check_task(draft)
             for mention in fields.mentions:
                 self._store.upsert_member(space.id, mention.user, mention.name)
             task = self._store.create_task(draft)
@@ -423,16 +356,10 @@ class TodoService:
         space_name: str | None = None,
         include_archived: bool = False,
     ) -> TaskListResult:
-        """List the tasks of a space (archived ones only on request).
+        """List tasks by seq in the named bound space or current space.
 
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-            space_name: Bound space to list instead of the current one.
-            include_archived: Also include ARCHIVED tasks.
-
-        Returns:
-            The space, its tasks ordered by ``seq`` and display names.
+        ARCHIVED tasks are excluded unless requested. Resolves actor membership
+        and returns the space and nonempty member nicknames.
 
         Raises:
             TodoError: Unbound space name.
@@ -448,15 +375,7 @@ class TodoService:
             )
 
     def show_task(self, actor: Actor, auto_name: str, ref: TaskRef) -> TaskResult:
-        """Return one task (any member may read).
-
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-            ref: Task reference.
-
-        Returns:
-            The task.
+        """Read a task in a bound space, resolving actor membership.
 
         Raises:
             TodoError: Unbound space name or unknown task.
@@ -468,19 +387,10 @@ class TodoService:
     def set_status(
         self, actor: Actor, auto_name: str, ref: TaskRef, status: TaskStatus
     ) -> TaskResult:
-        """Change a task's status (creator, assignee or space admin).
+        """Change status as creator, assignee or space admin.
 
-        DONE sets ``done_at`` to now, ARCHIVED keeps it, TODO and DOING clear
-        it. Setting the current status again changes nothing.
-
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-            ref: Task reference.
-            status: New status.
-
-        Returns:
-            The task after the change.
+        DONE sets done_at to now; ARCHIVED keeps it; TODO/DOING clear it.
+        Setting the existing status is a no-op.
 
         Raises:
             TodoError: Unknown task or permission denied.
@@ -493,16 +403,9 @@ class TodoService:
     def assign(
         self, actor: Actor, auto_name: str, ref: TaskRef, ops: AssignOps
     ) -> TaskResult:
-        """Replace or add/remove assignees; mentioned users become members.
+        """Replace or add/remove assignees; mentions become members.
 
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-            ref: Task reference.
-            ops: Parsed assign arguments.
-
-        Returns:
-            The task after the change, with the users not assigned before.
+        Returns the saved task and users not previously assigned.
 
         Raises:
             TodoError: Unknown task, permission denied or too many assignees.
@@ -519,38 +422,28 @@ class TodoService:
                 merged = dict.fromkeys((*task.assignees, *(m.user for m in ops.add)))
                 assignees = tuple(user for user in merged if user not in removed)
             updated = dcs.replace(task, assignees=assignees)
-            self._check_task(updated)
-            for mention in added:
-                self._store.upsert_member(space.id, mention.user, mention.name)
-            if assignees == task.assignees:
+            task_ops.check_task(updated)
+            saved = task_ops.apply(
+                self._store,
+                self._clock,
+                task,
+                updated,
+                actor=actor.user,
+                actor_label="",
+                session=actor.session,
+                added_assignees=added,
+            )
+            if saved is None:
                 return self._result(space, task)
-            saved = self._store.update_task(updated)
-            detail = {
-                "assignees": [
-                    [user.key for user in task.assignees],
-                    [user.key for user in assignees],
-                ]
-            }
-            self._log(actor, saved, EventAction.ASSIGN, detail)
             added = tuple(user for user in assignees if user not in task.assignees)
             return self._result(space, saved, added)
 
     def edit_task(
         self, actor: Actor, auto_name: str, ref: TaskRef, fields: TaskFields
     ) -> TaskResult:
-        """Edit title, due time, priority and tags.
+        """Edit title, due time, priority and tags; reject assignee mentions.
 
-        Changing ``due_at`` resets ``reminded``. Mentions are rejected here;
-        assignees change through ``assign``.
-
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-            ref: Task reference.
-            fields: Parsed fields.
-
-        Returns:
-            The task after the change.
+        Due changes reset reminded; clear flags override values.
 
         Raises:
             TodoError: Unknown task, permission denied, no change, mentions
@@ -577,16 +470,7 @@ class TodoService:
     def set_description(
         self, actor: Actor, auto_name: str, ref: TaskRef, text: str
     ) -> TaskResult:
-        """Set (or clear with an empty ``text``) a task's description.
-
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-            ref: Task reference.
-            text: Markdown source.
-
-        Returns:
-            The task after the change.
+        """Set the stripped description, or clear it with empty text.
 
         Raises:
             TodoError: Unknown task, permission denied or text too long.
@@ -600,20 +484,10 @@ class TodoService:
     def update_task(
         self, actor: Actor, auto_name: str, ref: TaskRef, change: TaskUpdate
     ) -> TaskResult:
-        """Apply a combined change atomically (used by the LLM tool).
+        """Apply all combined changes atomically, with shared task rules.
 
-        Either every part of ``change`` is applied or, on any error, none.
-        Permission and logging follow the single-purpose operations; an
-        update that changes nothing returns the task as it is.
-
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-            ref: Task reference.
-            change: The requested changes.
-
-        Returns:
-            The task after the change, with the users not assigned before.
+        Returns the unchanged task on a no-op, otherwise the saved task and
+        newly assigned users. Any failure rolls back every part of the change.
 
         Raises:
             TodoError: Unknown task, permission denied or a violated limit.
@@ -635,19 +509,10 @@ class TodoService:
         nickname: str,
         space_name: str | None = None,
     ) -> list[Member]:
-        """Members of the target space whose nickname equals ``nickname``.
+        """Find members by exact casefolded nickname, ignoring outer whitespace.
 
-        The comparison ignores case and surrounding whitespace; there is no
-        fuzzy matching. Used to resolve assignee names given by the LLM.
-
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-            nickname: Display name to look up.
-            space_name: Bound space to search instead of the current one.
-
-        Returns:
-            Matching members (empty, one, or several when ambiguous).
+        Returns zero or more matches, never fuzzy matches, in the named bound
+        space or actor's current space. Used for LLM assignee resolution.
 
         Raises:
             TodoError: Unbound space name.
@@ -664,15 +529,9 @@ class TodoService:
             ]
 
     def delete_task(self, actor: Actor, auto_name: str, ref: TaskRef) -> TaskResult:
-        """Hard-delete a task, logging a full snapshot (creator or admin).
+        """Hard-delete as creator or admin, retaining a full snapshot event.
 
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-            ref: Task reference.
-
-        Returns:
-            The task as it was before deletion.
+        Returns the task as it was before deletion.
 
         Raises:
             TodoError: Unknown task or permission denied.
@@ -687,18 +546,10 @@ class TodoService:
             return self._result(space, task)
 
     def mine(self, actor: Actor) -> tuple[list[tuple[str, Task]], dict[str, str]]:
-        """Open tasks assigned to the actor.
+        """List actor's TODO/DOING assignments ordered by due time.
 
-        In a group chat only spaces bound to the current session are listed,
-        so tasks of other groups and personal spaces never leak into the
-        group. In a private chat all spaces are listed.
-
-        Args:
-            actor: The requesting user.
-
-        Returns:
-            ``(space_name, task)`` pairs ordered by due time, and display names
-            of members of the listed spaces only.
+        Private chats span all spaces; groups only include spaces bound here.
+        Returns (space_name, task) pairs and nicknames from listed spaces only.
         """
         tasks = self._store.list_tasks_assigned_to(actor.user, MINE_STATUSES)
         if not actor.is_private:
@@ -716,16 +567,7 @@ class TodoService:
     def list_spaces(
         self, actor: Actor, auto_name: str
     ) -> list[tuple[Space, bool, bool]]:
-        """Spaces bound to the session with default/current flags.
-
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-
-        Returns:
-            ``(space, is_session_default, is_current_for_actor)`` rows in
-            binding order.
-        """
+        """List bound spaces in binding order with default/current flags."""
         with self._store.transaction():
             current, _ = self._space(actor, auto_name, None)
             default = self._store.get_session_default(actor.session)
@@ -739,14 +581,7 @@ class TodoService:
             ]
 
     def use_space(self, actor: Actor, name: str) -> Space:
-        """Switch the actor's current space in this session.
-
-        Args:
-            actor: The requesting user.
-            name: Name of a space bound to the session.
-
-        Returns:
-            The new current space.
+        """Switch only the actor's current space in this session.
 
         Raises:
             TodoError: Unbound space name.
@@ -757,14 +592,7 @@ class TodoService:
             return space
 
     def set_default(self, actor: Actor, name: str) -> Space:
-        """Change the session's default space (session admin).
-
-        Args:
-            actor: The requesting user.
-            name: Name of a space bound to the session.
-
-        Returns:
-            The new default space.
+        """Change this session's default space as a session admin.
 
         Raises:
             TodoError: Permission denied or unbound space name.
@@ -776,14 +604,7 @@ class TodoService:
             return space
 
     def new_space(self, actor: Actor, name: str) -> Space:
-        """Create a space owned by the actor, bind it, make it their current.
-
-        Args:
-            actor: The requesting user.
-            name: Space name; must be unused in this session.
-
-        Returns:
-            The new space.
+        """Create, own and bind a space, then select it for the actor.
 
         Raises:
             TodoError: Permission denied, invalid or taken name.
@@ -797,20 +618,16 @@ class TodoService:
             self._store.upsert_member(space.id, actor.user, actor.nickname)
             self._store.bind(actor.session, space.id)
             self._store.set_current(actor.session, actor.user, space.id)
+            self._space_log(actor, space, SpaceEventAction.CREATE, {"name": space.name})
+            self._space_log(
+                actor, space, SpaceEventAction.BIND, {"session": actor.session}
+            )
             return space
 
     def rename_space(self, actor: Actor, auto_name: str, name: str) -> Space:
-        """Rename the current space (space admin).
+        """Rename the current space as a space admin.
 
-        The new name must be free in every session the space is bound to.
-
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-            name: New name.
-
-        Returns:
-            The renamed space.
+        The new name must be free in every session bound to this space.
 
         Raises:
             TodoError: Permission denied, invalid or taken name.
@@ -825,23 +642,20 @@ class TodoService:
                 taken = self._store.session_space_names(binding.session).get(name)
                 if taken not in (None, space.id):
                     raise TodoError(f"空间名「{name}」在某个绑定会话里已被占用")
-            return self._store.rename_space(space.id, name)
+            renamed = self._store.rename_space(space.id, name)
+            self._space_log(
+                actor, space, SpaceEventAction.RENAME, {"name": [space.name, name]}
+            )
+            return renamed
 
     def delete_space(self, actor: Actor, name: str, code: str | None) -> str | None:
-        """Delete a bound space after a confirmation round (owner).
+        """Delete a bound space as owner after a confirmation round.
 
-        Args:
-            actor: The requesting user.
-            name: Name of a space bound to the session.
-            code: ``None`` to request a confirmation code, else the code.
-
-        Returns:
-            The confirmation code to show when ``code`` is ``None``; ``None``
-            once the space has been deleted.
+        Returns a confirmation code when code is None; otherwise deletes and
+        returns None. A wrong or expired code voids the pending confirmation.
 
         Raises:
-            TodoError: Unbound name, permission denied, or wrong/expired code
-                (which voids the pending code).
+            TodoError: Unbound name, permission denied or invalid code.
         """
         with self._store.transaction():
             space = self._bound_space(actor.session, name)
@@ -858,15 +672,9 @@ class TodoService:
             return None
 
     def create_invite(self, actor: Actor, auto_name: str) -> tuple[Space, str, Invite]:
-        """Issue a new invite for the current space; the old one stops working.
+        """Reset the current space's invite as a space admin.
 
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-
-        Returns:
-            The space, the plain code (show once, never log) and the stored
-            invite.
+        Returns the space, plain code (show once, never log) and stored invite.
 
         Raises:
             TodoError: Permission denied.
@@ -878,26 +686,20 @@ class TodoService:
             )
             code, invite = new_invite(space.id, self._clock())
             self._store.set_invite(invite.space_id, invite.code_hash, invite.expires_at)
+            self._space_log(
+                actor, space, SpaceEventAction.INVITE, {"expires_at": invite.expires_at}
+            )
             return space, code, invite
 
     def join_space(self, actor: Actor, code: str) -> Space:
-        """Bind the session to the space of an invite code (session admin).
+        """Bind this session using an invite as a session admin.
 
-        Invalid or expired codes count against the session's rate limit. A
-        valid code whose space name is already used by another space bound to
-        this session is rejected without counting; the shared space is never
-        renamed on join.
-
-        Args:
-            actor: The requesting user.
-            code: Invite code as typed.
-
-        Returns:
-            The joined space.
+        Invalid/expired codes count against the session's rate limit; name
+        collisions do not. Joining never renames the shared space.
 
         Raises:
-            TodoError: Permission denied, rate limited, invalid or expired
-                code, space already bound, or its name taken here.
+            TodoError: Permission denied, rate limited, invalid/expired code,
+                space already bound, or name taken here.
         """
         perms.require(perms.can_run_session_op(actor), perms.Op.SESSION)
         if not code.strip():
@@ -920,17 +722,13 @@ class TodoService:
                 )
             self._store.bind(actor.session, space.id)
             self._store.upsert_member(space.id, actor.user, actor.nickname)
+            self._space_log(
+                actor, space, SpaceEventAction.BIND, {"session": actor.session}
+            )
             return space
 
     def leave_space(self, actor: Actor, name: str) -> Space:
-        """Unbind a space from the session (session admin).
-
-        Args:
-            actor: The requesting user.
-            name: Name of a space bound to the session.
-
-        Returns:
-            The unbound space (it is kept, only the binding goes).
+        """Unbind as session admin, keeping the space and clearing selections.
 
         Raises:
             TodoError: Permission denied or unbound space name.
@@ -939,17 +737,13 @@ class TodoService:
         with self._store.transaction():
             space = self._bound_space(actor.session, name)
             self._store.unbind(actor.session, space.id)
+            self._space_log(
+                actor, space, SpaceEventAction.UNBIND, {"session": actor.session}
+            )
             return space
 
     def claim(self, actor: Actor, auto_name: str) -> Space:
-        """Take ownership of the ownerless current space (group chats only).
-
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-
-        Returns:
-            The claimed space.
+        """Claim the ownerless current space as a group-session admin.
 
         Raises:
             TodoError: Private chat, not a session admin, or space owned.
@@ -959,20 +753,16 @@ class TodoService:
         with self._store.transaction():
             space, _ = self._space(actor, auto_name, None)
             perms.require(perms.can_claim(actor, space), perms.Op.CLAIM)
-            return self._store.set_space_owner(space.id, actor.user)
+            claimed = self._store.set_space_owner(space.id, actor.user)
+            self._space_log(actor, space, SpaceEventAction.CLAIM, {})
+            return claimed
 
     def set_admins(
         self, actor: Actor, auto_name: str, ops: AssignOps
     ) -> tuple[Space, list[Member]]:
-        """Appoint (``+@x``) or revoke (``-@x``) admins of the current space.
+        """Appoint (+@x) or revoke (-@x) admins; every mention needs a sign.
 
-        Args:
-            actor: The requesting user.
-            auto_name: Base name if the session's space must be auto-created.
-            ops: Parsed arguments; every mention must carry a sign.
-
-        Returns:
-            The space and the updated member rows.
+        Returns the space and updated member rows; only actual changes log.
 
         Raises:
             TodoError: Bad usage, permission denied, target not a member, or
@@ -996,4 +786,11 @@ class TodoService:
                 if target.role == SpaceRole.OWNER or target.user == space.owner:
                     raise TodoError("不能修改所有者的角色")
                 changed.append(self._store.set_member_role(space.id, target.user, role))
+                if target.role != role:
+                    self._space_log(
+                        actor,
+                        space,
+                        SpaceEventAction.ROLE,
+                        {"user": target.user.key, "role": [target.role, role]},
+                    )
             return space, changed

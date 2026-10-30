@@ -753,3 +753,51 @@ async def test_list_and_use_spaces(tools, service):
     assert data_of(used) == {"space": SPACE}
     assert after[0]["current"] is True and after[1]["current"] is False
     assert unknown == "Error: 本会话没有绑定名为「Nope」的空间"
+
+
+# ----- M3: session titles ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_calls_record_the_session_title(tools, service, monkeypatch):
+    # Arrange
+    calls = []
+    monkeypatch.setattr(service, "note_session_title", lambda *args: calls.append(args))
+
+    # Act
+    await call(tools, "teamtodo_list_spaces", FakeEvent(private=True, name=" Al "))
+    await call(tools, "teamtodo_list_spaces", FakeEvent(private=True, name=""))
+    await call(tools, "teamtodo_list_spaces", FakeEvent())
+
+    # Assert: the group has no known name here, so only the private chat counts.
+    assert calls == [(PRIVATE, "Al")]
+
+
+@pytest.mark.asyncio
+async def test_real_service_stores_the_private_title(tools, store):
+    # Act
+    await call(tools, "teamtodo_list_spaces", FakeEvent(private=True))
+
+    # Assert
+    assert store.get_session_titles([PRIVATE]) == {PRIVATE: "Alice"}
+
+
+@pytest.mark.asyncio
+async def test_session_title_failure_does_not_break_the_tool(
+    tools, service, monkeypatch
+):
+    # Arrange
+    errors = []
+
+    def fail(*args):
+        raise RuntimeError("db is gone")
+
+    monkeypatch.setattr(service, "note_session_title", fail)
+    monkeypatch.setattr(llm_tools.logger, "exception", lambda *a: errors.append(a))
+
+    # Act
+    result = await call(tools, "teamtodo_list_spaces", FakeEvent(private=True))
+
+    # Assert
+    assert not result.startswith("Error")
+    assert len(errors) == 1

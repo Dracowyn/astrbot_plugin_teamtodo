@@ -393,6 +393,15 @@ class TeamTodoToolkit:
         if service is None:
             raise TodoError("the TeamTodo plugin is not ready; try again later")
         actor = build_actor(event, info)
+        # Session title for the WebUI (design 7); must never break the tool.
+        title = (
+            (event.get_sender_name() if actor.is_private else info.group_name) or ""
+        ).strip()
+        if title:
+            try:
+                service.note_session_title(actor.session, title)
+            except Exception:
+                logger.exception("[teamtodo] Failed to record the session title")
         auto_name = auto_space_name(
             actor.is_private, info.group_name, str(event.get_group_id() or "")
         )

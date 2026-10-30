@@ -1,17 +1,24 @@
-"""Behavioral coverage for the framework-independent chat renderer."""
+"""Behavioral coverage for chat rendering and resilient WebUI event summaries."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from astrbot_plugin_teamtodo.core.models import (
+    EventAction,
     Priority,
     Space,
+    SpaceEvent,
+    SpaceEventAction,
+    SpaceRole,
     Task,
+    TaskEvent,
     TaskStatus,
     UserRef,
 )
 from astrbot_plugin_teamtodo.services.render import (
+    event_actor_name,
+    event_summary,
     format_due,
     help_text,
     mine_list,
@@ -333,3 +340,355 @@ def test_reminder_text_other_year(year, expected):
     assert (
         reminder_text(task, "研发", NOW, SHANGHAI) == f"⏰ 研发#3 发布页面 {expected}"
     )
+
+
+def make_event(action, detail, *, space=False, **changes):
+    fields = {
+        "id": 1,
+        "space_id": 1,
+        "action": action,
+        "detail": detail,
+        "actor": ALICE,
+        "actor_label": "",
+        "session": "qq-main:GroupMessage:123",
+        "created_at": NOW,
+    }
+    fields.update(changes)
+    if space:
+        return SpaceEvent(**fields)
+    return TaskEvent(task_seq=3, **fields)
+
+
+@pytest.mark.parametrize(
+    "action,detail,expected",
+    [
+        (EventAction.CREATE, {"title": "写周报"}, "创建任务 #3「写周报」"),
+        (EventAction.STATUS, {"status": ["todo", "doing"]}, "#3 状态：待办 → 进行中"),
+        (
+            EventAction.STATUS,
+            {"status": [TaskStatus.DOING, TaskStatus.DONE]},
+            "#3 状态：进行中 → 已完成",
+        ),
+        (
+            EventAction.STATUS,
+            {"status": ["archived", "todo"]},
+            "#3 状态：已归档 → 待办",
+        ),
+        (EventAction.ARCHIVE, {"status": ["done", "archived"]}, "#3 归档"),
+        (EventAction.ARCHIVE, {"auto": True}, "#3 自动归档"),
+        (
+            EventAction.ARCHIVE,
+            {"status": ["done", "archived"], "auto": True},
+            "#3 自动归档",
+        ),
+        (
+            EventAction.DELETE,
+            {"snapshot": {"title": "写周报", "description": "秘密描述"}},
+            "删除任务 #3「写周报」",
+        ),
+        (
+            EventAction.ASSIGN,
+            {"assignees": [[ALICE.key], [ALICE.key, BOB.key]]},
+            "#3 负责人：@张三 → @张三 @李四",
+        ),
+    ],
+)
+def test_task_event_summary_actions(action, detail, expected):
+    names = {ALICE.key: "张三", BOB.key: "李四"}
+    assert event_summary(make_event(action, detail), names, SHANGHAI) == expected
+
+
+@pytest.mark.parametrize(
+    "old,new,expected",
+    [
+        ([], ["qq-main:user:with:colons"], "#3 负责人：无 → @user:with:colons"),
+        ([ALICE.key, BOB.key], [], "#3 负责人：@alice-id @bob-id → 无"),
+    ],
+)
+def test_event_assignees_empty_lists_and_user_key_fallback(old, new, expected):
+    event = make_event(EventAction.ASSIGN, {"assignees": [old, new]})
+    assert (
+        event_summary(event, {ALICE.key: "", "elsewhere:bob-id": "错误"}, UTC)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "detail,expected",
+    [
+        ({"title": ["旧", "新"]}, "修改 #3：标题"),
+        ({"due_at": [None, NOW]}, "修改 #3：截止时间"),
+        ({"priority": [None, Priority.HIGH]}, "修改 #3：优先级"),
+        ({"priority": ["medium", "low"]}, "修改 #3：优先级"),
+        ({"priority": ["high", None]}, "修改 #3：优先级"),
+        ({"tags": [[], ["发布"]]}, "修改 #3：标签"),
+        ({"description": ["秘密旧描述", "秘密新描述"]}, "修改 #3：描述"),
+        (
+            {
+                "title": ["旧", "新"],
+                "due_at": [NOW, None],
+                "priority": [Priority.HIGH, Priority.MEDIUM],
+                "tags": [("旧",), ("新",)],
+                "description": ["秘密旧描述", "秘密新描述"],
+            },
+            "修改 #3：标题、截止时间、优先级、标签、描述",
+        ),
+    ],
+)
+def test_update_event_lists_changed_fields_without_values_or_description(
+    detail, expected
+):
+    rendered = event_summary(make_event(EventAction.UPDATE, detail), {}, SHANGHAI)
+    assert rendered == expected
+    assert "秘密" not in rendered
+
+
+@pytest.mark.parametrize(
+    "action,detail,expected",
+    [
+        (SpaceEventAction.CREATE, {"name": "研发"}, "创建空间「研发」"),
+        (SpaceEventAction.RENAME, {"name": ["旧", "新"]}, "空间改名：旧 → 新"),
+        (
+            SpaceEventAction.BIND,
+            {"session": "qq-main:GroupMessage:123"},
+            "绑定会话：qq-main:GroupMessage:123",
+        ),
+        (
+            SpaceEventAction.UNBIND,
+            {"session": "qq-main:GroupMessage:123"},
+            "解绑会话：qq-main:GroupMessage:123",
+        ),
+        (SpaceEventAction.CLAIM, {}, "认领空间"),
+        (
+            SpaceEventAction.ROLE,
+            {"user": BOB.key, "role": ["member", "admin"]},
+            "@李四：成员 → 管理员",
+        ),
+        (
+            SpaceEventAction.ROLE,
+            {"user": ALICE.key, "role": [SpaceRole.OWNER, SpaceRole.MEMBER]},
+            "@张三：所有者 → 成员",
+        ),
+        (
+            SpaceEventAction.INVITE,
+            {"expires_at": datetime(2026, 11, 6, 10, tzinfo=UTC).timestamp()},
+            "重置邀请码，有效期至 11-06 18:00",
+        ),
+    ],
+)
+def test_space_event_summary_actions(action, detail, expected):
+    event = make_event(action, detail, space=True)
+    assert (
+        event_summary(event, {ALICE.key: "张三", BOB.key: "李四"}, SHANGHAI) == expected
+    )
+
+
+def test_space_role_user_key_fallback_splits_at_first_colon():
+    event = make_event(
+        SpaceEventAction.ROLE,
+        {"user": "qq-main:user:with:colons", "role": ["admin", "member"]},
+        space=True,
+    )
+    assert (
+        event_summary(event, {"qq-main:user:with:colons": ""}, UTC)
+        == "@user:with:colons：管理员 → 成员"
+    )
+
+
+@pytest.mark.parametrize(
+    "created_at,expires_at,expected",
+    [
+        (
+            datetime(2020, 1, 1, tzinfo=UTC).timestamp(),
+            datetime(2020, 11, 6, 10, tzinfo=UTC).timestamp(),
+            "重置邀请码，有效期至 11-06 18:00",
+        ),
+        (
+            datetime(2020, 1, 1, tzinfo=UTC).timestamp(),
+            datetime(2021, 11, 6, 10, tzinfo=UTC).timestamp(),
+            "重置邀请码，有效期至 2021-11-06 18:00",
+        ),
+    ],
+)
+def test_event_due_format_uses_event_creation_time(created_at, expires_at, expected):
+    event = make_event(
+        SpaceEventAction.INVITE,
+        {"expires_at": expires_at},
+        space=True,
+        created_at=created_at,
+    )
+    assert event_summary(event, {}, SHANGHAI) == expected
+
+
+@pytest.mark.parametrize("action", list(EventAction))
+@pytest.mark.parametrize("detail", [None, [], "broken", 7, True])
+def test_every_task_action_rejects_non_dictionary_detail(action, detail):
+    assert event_summary(make_event(action, detail), {}, UTC) == action.value
+
+
+@pytest.mark.parametrize("action", list(SpaceEventAction))
+@pytest.mark.parametrize("detail", [None, [], "broken", 7, True])
+def test_every_space_action_rejects_non_dictionary_detail(action, detail):
+    assert (
+        event_summary(make_event(action, detail, space=True), {}, UTC) == action.value
+    )
+
+
+@pytest.mark.parametrize(
+    "action,detail",
+    [
+        (EventAction.CREATE, {}),
+        (EventAction.CREATE, {"title": []}),
+        (EventAction.UPDATE, {}),
+        (EventAction.UPDATE, {"unknown": ["old", "new"]}),
+        (EventAction.UPDATE, {"title": "ab"}),
+        (EventAction.UPDATE, {"title": ["old"]}),
+        (EventAction.UPDATE, {"title": ["old", "new", "extra"]}),
+        (EventAction.UPDATE, {"title": [[], "new"]}),
+        (EventAction.UPDATE, {"description": [None, "text"]}),
+        (EventAction.UPDATE, {"tags": ["tag", []]}),
+        (EventAction.UPDATE, {"tags": [[{}], []]}),
+        (EventAction.UPDATE, {"priority": [[], "high"]}),
+        (EventAction.UPDATE, {"priority": ["invalid", "high"]}),
+        (EventAction.UPDATE, {"due_at": ["tomorrow", None]}),
+        (EventAction.UPDATE, {"due_at": [True, None]}),
+        (EventAction.STATUS, {}),
+        (EventAction.STATUS, {"status": "todo"}),
+        (EventAction.STATUS, {"status": ["todo"]}),
+        (EventAction.STATUS, {"status": [["todo"], "doing"]}),
+        (EventAction.STATUS, {"status": ["todo", "invalid"]}),
+        (EventAction.ASSIGN, {}),
+        (EventAction.ASSIGN, {"assignees": ["qq-main:alice", []]}),
+        (EventAction.ASSIGN, {"assignees": [[{}], []]}),
+        (EventAction.ASSIGN, {"assignees": [["missing-platform"], []]}),
+        (EventAction.ASSIGN, {"assignees": [[":missing-platform"], []]}),
+        (EventAction.ASSIGN, {"assignees": [["qq-main:"], []]}),
+        (EventAction.ARCHIVE, {}),
+        (EventAction.ARCHIVE, {"auto": "true"}),
+        (EventAction.ARCHIVE, {"auto": 1}),
+        (EventAction.ARCHIVE, {"auto": True, "status": ["bad", "archived"]}),
+        (EventAction.ARCHIVE, {"status": ["done", "todo"]}),
+        (EventAction.DELETE, {}),
+        (EventAction.DELETE, {"snapshot": []}),
+        (EventAction.DELETE, {"snapshot": "secret description"}),
+        (EventAction.DELETE, {"snapshot": {}}),
+        (EventAction.DELETE, {"snapshot": {"title": None}}),
+    ],
+)
+def test_malformed_task_detail_falls_back_to_action(action, detail):
+    assert event_summary(make_event(action, detail), {}, UTC) == action.value
+
+
+@pytest.mark.parametrize(
+    "action,detail",
+    [
+        (SpaceEventAction.CREATE, {}),
+        (SpaceEventAction.CREATE, {"name": {}}),
+        (SpaceEventAction.RENAME, {"name": "ab"}),
+        (SpaceEventAction.RENAME, {"name": ["old", None]}),
+        (SpaceEventAction.BIND, {"session": []}),
+        (SpaceEventAction.UNBIND, {}),
+        (SpaceEventAction.ROLE, {"user": BOB.key, "role": ["member", "invalid"]}),
+        (SpaceEventAction.ROLE, {"user": BOB.key, "role": [["member"], "admin"]}),
+        (SpaceEventAction.ROLE, {"user": BOB.key, "role": ["member"]}),
+        (SpaceEventAction.ROLE, {"user": [], "role": ["member", "admin"]}),
+        (SpaceEventAction.ROLE, {"user": "unqualified", "role": ["member", "admin"]}),
+        (SpaceEventAction.INVITE, {}),
+        (SpaceEventAction.INVITE, {"expires_at": None}),
+        (SpaceEventAction.INVITE, {"expires_at": "tomorrow"}),
+        (SpaceEventAction.INVITE, {"expires_at": True}),
+    ],
+)
+def test_malformed_space_detail_falls_back_to_action(action, detail):
+    assert (
+        event_summary(make_event(action, detail, space=True), {}, UTC) == action.value
+    )
+
+
+@pytest.mark.parametrize(
+    "timestamp", [float("nan"), float("inf"), -float("inf"), 1e100, 10**1000]
+)
+def test_invalid_event_timestamps_never_raise(timestamp):
+    update = make_event(EventAction.UPDATE, {"due_at": [None, timestamp]})
+    invite = make_event(SpaceEventAction.INVITE, {"expires_at": timestamp}, space=True)
+    created = make_event(
+        SpaceEventAction.INVITE, {"expires_at": NOW}, space=True, created_at=timestamp
+    )
+    assert event_summary(update, {}, UTC) == "update"
+    assert event_summary(invite, {}, UTC) == "invite"
+    assert event_summary(created, {}, UTC) == "invite"
+
+
+@pytest.mark.parametrize("created_at", [None, "today", True, [], {}])
+def test_invalid_creation_timestamp_falls_back_for_event_due_time(created_at):
+    event = make_event(
+        SpaceEventAction.INVITE, {"expires_at": NOW}, space=True, created_at=created_at
+    )
+    assert event_summary(event, {}, UTC) == "invite"
+
+
+def test_unknown_event_actions_fall_back_to_action_name():
+    assert (
+        event_summary(make_event("future-task-action", {}), {}, UTC)
+        == "future-task-action"
+    )
+    assert (
+        event_summary(make_event("future-space-action", {}, space=True), {}, UTC)
+        == "future-space-action"
+    )
+
+
+@pytest.mark.parametrize("space", [False, True])
+@pytest.mark.parametrize(
+    "actor,actor_label,nicknames,expected",
+    [
+        (ALICE, "dashboard-name", {ALICE.key: "张三"}, "张三"),
+        (ALICE, "dashboard-name", {}, "alice-id"),
+        (ALICE, "", {ALICE.key: ""}, "alice-id"),
+        (ALICE, "", {"different-adapter:alice-id": "错误昵称"}, "alice-id"),
+        (
+            UserRef(platform_id="qq-main", user_id="user:with:colons"),
+            "",
+            {},
+            "user:with:colons",
+        ),
+        (None, "dashboard-name", {}, "dashboard-name"),
+        (None, "", {}, "系统"),
+    ],
+)
+def test_event_actor_identity_precedence(
+    space, actor, actor_label, nicknames, expected
+):
+    action = SpaceEventAction.CLAIM if space else EventAction.ARCHIVE
+    event = make_event(action, {}, space=space, actor=actor, actor_label=actor_label)
+    assert event_actor_name(event, nicknames) == expected
+
+
+def test_delete_summary_accepts_complete_service_snapshot_without_description():
+    task = make_task(description="秘密描述\n第二行", assignees=(ALICE,))
+    event = make_event(EventAction.DELETE, {"snapshot": asdict(task)})
+    assert event_summary(event, {}, UTC) == "删除任务 #3「发布页面」"
+
+
+def test_tuple_event_pairs_and_assignee_sequences_are_supported():
+    event = make_event(EventAction.ASSIGN, {"assignees": ((ALICE.key,), (BOB.key,))})
+    assert event_summary(event, {}, UTC) == "#3 负责人：@alice-id → @bob-id"
+    status = make_event(
+        EventAction.STATUS, {"status": (TaskStatus.DONE, TaskStatus.DOING)}
+    )
+    assert event_summary(status, {}, UTC) == "#3 状态：已完成 → 进行中"
+
+
+def test_malformed_additional_field_prevents_partial_update_summary():
+    event = make_event(
+        EventAction.UPDATE,
+        {"title": ["旧", "新"], "description": ["秘密", None]},
+    )
+    assert event_summary(event, {}, UTC) == "update"
+
+
+def test_absent_space_role_user_and_unhashable_snapshot_title_fall_back():
+    role = make_event(SpaceEventAction.ROLE, {"role": ["member", "admin"]}, space=True)
+    snapshot = make_event(EventAction.DELETE, {"snapshot": {"title": []}})
+    assert event_summary(role, {}, UTC) == "role"
+    assert event_summary(snapshot, {}, UTC) == "delete"

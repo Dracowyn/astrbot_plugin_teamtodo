@@ -4,8 +4,8 @@ CONTRACT (owned by the main loop; implementers fill in the bodies, signatures
 and documented behaviour are fixed):
 
 - One ``sqlite3`` connection per ``Store``, WAL mode, ``foreign_keys=ON``,
-  schema versioned with ``PRAGMA user_version`` (M1 = version 1). Later
-  milestones add tables through numbered migrations, never by editing v1.
+  schema versioned with ``PRAGMA user_version`` (M1 = version 1, M3 = version 2).
+  Later milestones add tables through numbered migrations, never by editing v1.
 - Every mutating method must run inside ``with store.transaction():`` and
   raises ``RuntimeError`` otherwise. ``transaction()`` issues
   ``BEGIN IMMEDIATE`` and commits on success, rolls back on exception.
@@ -34,6 +34,7 @@ from .models import (
     Priority,
     Space,
     SpaceEvent,
+    SpaceEventAction,
     SpaceEventDraft,
     SpaceRole,
     Task,
@@ -147,7 +148,27 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
     cascades on space deletion, with an index on
     ``(space_id, created_at DESC, id DESC)``.
     """
-    # Stub so existing stores still open while M3 is implemented.
+    statements = (
+        """CREATE TABLE session_titles (
+            session TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )""",
+        """CREATE TABLE space_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            space_id INTEGER NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+            action TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            actor_platform TEXT,
+            actor_user TEXT,
+            actor_label TEXT NOT NULL,
+            session TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )""",
+        "CREATE INDEX space_event_space ON space_events(space_id, created_at DESC, id DESC)",
+    )
+    for statement in statements:
+        conn.execute(statement)
 
 
 _MIGRATIONS = (_migrate_v1, _migrate_v2)
@@ -657,23 +678,60 @@ class Store:
 
     def add_space_event(self, draft: SpaceEventDraft) -> SpaceEvent:
         """Append a space-level log entry (``detail`` stored as JSON). (M3)"""
-        raise NotImplementedError
+        self._require_transaction()
+        cursor = self._conn.execute(
+            """INSERT INTO space_events (space_id, action, detail,
+                actor_platform, actor_user, actor_label, session, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                draft.space_id,
+                draft.action,
+                json.dumps(draft.detail, ensure_ascii=False),
+                draft.actor.platform_id if draft.actor else None,
+                draft.actor.user_id if draft.actor else None,
+                draft.actor_label,
+                draft.session,
+                self._clock(),
+            ),
+        )
+        row = self._conn.execute(
+            "SELECT * FROM space_events WHERE id=?", (cursor.lastrowid,)
+        ).fetchone()
+        return self._space_event(row)
 
     def list_space_events(self, space_id: int, limit: int = 50) -> list[SpaceEvent]:
         """Space-level entries of a space, newest first (``created_at DESC,
         id DESC``). (M3)"""
-        raise NotImplementedError
+        rows = self._conn.execute(
+            """SELECT * FROM space_events WHERE space_id=?
+               ORDER BY created_at DESC, id DESC LIMIT ?""",
+            (space_id, limit),
+        )
+        return [self._space_event(row) for row in rows]
 
     # ----- session titles -----
 
     def set_session_title(self, session: str, title: str) -> None:
         """Insert or replace the display title of a session; ``updated_at`` is
         the store clock. Requires a transaction. (M3)"""
-        raise NotImplementedError
+        self._require_transaction()
+        self._conn.execute(
+            """INSERT INTO session_titles (session, title, updated_at)
+               VALUES (?, ?, ?) ON CONFLICT(session) DO UPDATE
+               SET title=excluded.title, updated_at=excluded.updated_at""",
+            (session, title, self._clock()),
+        )
 
     def get_session_titles(self, sessions: list[str]) -> dict[str, str]:
         """Titles of the given sessions; sessions without one are absent. (M3)"""
-        raise NotImplementedError
+        if not sessions:
+            return {}
+        placeholders = ",".join("?" for _ in sessions)
+        rows = self._conn.execute(
+            f"SELECT session, title FROM session_titles WHERE session IN ({placeholders})",
+            sessions,
+        )
+        return {row["session"]: row["title"] for row in rows}
 
     # ----- invites -----
 
@@ -692,6 +750,13 @@ class Store:
         """Look up by hash; expired invites are returned too (caller checks)."""
         row = self._conn.execute(
             "SELECT * FROM invites WHERE code_hash=?", (code_hash,)
+        ).fetchone()
+        return Invite(**row) if row is not None else None
+
+    def get_invite(self, space_id: int) -> Invite | None:
+        """Look up by space; expired invites are returned too (caller checks)."""
+        row = self._conn.execute(
+            "SELECT * FROM invites WHERE space_id=?", (space_id,)
         ).fetchone()
         return Invite(**row) if row is not None else None
 
@@ -797,6 +862,24 @@ class Store:
             space_id=row["space_id"],
             task_seq=row["task_seq"],
             action=EventAction(row["action"]),
+            detail=json.loads(row["detail"]),
+            actor=actor,
+            actor_label=row["actor_label"],
+            session=row["session"],
+            created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _space_event(row: sqlite3.Row) -> SpaceEvent:
+        actor = (
+            None
+            if row["actor_platform"] is None
+            else UserRef(platform_id=row["actor_platform"], user_id=row["actor_user"])
+        )
+        return SpaceEvent(
+            id=row["id"],
+            space_id=row["space_id"],
+            action=SpaceEventAction(row["action"]),
             detail=json.loads(row["detail"]),
             actor=actor,
             actor_label=row["actor_label"],

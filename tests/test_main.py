@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -81,12 +82,16 @@ class FakeContext:
 
     def __init__(self):
         self.tools = []
+        self.web_apis = []
         self.sent = []
         self.send_result = True
         self.send_error = None
 
     def add_llm_tools(self, *tools):
         self.tools.extend(tools)
+
+    def register_web_api(self, route, handler, methods, desc):
+        self.web_apis.append((route, handler, methods, desc))
 
     async def send_message(self, session, chain):
         if self.send_error is not None:
@@ -149,6 +154,24 @@ def loop(monkeypatch):
     monkeypatch.setattr(main, "run_loop", fake)
     monkeypatch.setattr(main, "ReminderService", FakeReminderService)
     return fake
+
+
+@pytest.fixture
+def titles(monkeypatch):
+    """Records ``note_session_title`` calls; set ``titles.error`` to fail."""
+
+    class Recorder(list):
+        error = None
+
+    calls = Recorder()
+
+    def note(self, session, title):
+        if calls.error is not None:
+            raise calls.error
+        calls.append((session, title))
+
+    monkeypatch.setattr(main.TodoService, "note_session_title", note)
+    return calls
 
 
 @pytest_asyncio.fixture
@@ -645,3 +668,89 @@ async def test_private_add_replies_with_plain_text(plugin):
 
     # Assert
     assert added == ["已创建：#1 [待办] 交接 @Bob"]
+
+
+# ----- M3: WebUI API lifecycle and session titles ---------------------------
+
+
+def test_registers_every_web_route_under_the_plugin_prefix(plugin):
+    # Act
+    routes = [(route, methods) for route, _, methods, _ in plugin.context.web_apis]
+
+    # Assert
+    assert len(routes) == 14
+    assert all(route.startswith("/astrbot_plugin_teamtodo/") for route, _ in routes)
+    assert ("/astrbot_plugin_teamtodo/spaces/<space_id>/tasks", ["POST"]) in routes
+    assert all(callable(handler) for _, handler, _, _ in plugin.context.web_apis)
+
+
+@pytest.mark.asyncio
+async def test_admin_service_follows_the_plugin_lifecycle(plugin):
+    # Arrange
+    from astrbot.api.web import PluginRequest, bind_request_context
+
+    handler = {r: h for r, h, m, _ in plugin.context.web_apis if m == ["GET"]}[
+        "/astrbot_plugin_teamtodo/spaces"
+    ]
+    raw = SimpleNamespace(
+        method="GET",
+        url=SimpleNamespace(path="/x"),
+        headers={},
+        cookies={},
+        client=None,
+        query_params=SimpleNamespace(multi_items=lambda: []),
+    )
+
+    # Act
+    await plugin.initialize()
+    await run(plugin, Comp.Plain(text="/todo add 写周报"), group=owner_group())
+    admin = plugin._admin_service
+    with bind_request_context(PluginRequest(raw, username="root")):
+        live = await handler()
+    await plugin.terminate()
+    with bind_request_context(PluginRequest(raw, username="root")):
+        stale = await handler()
+
+    # Assert
+    assert isinstance(admin, main.AdminService)
+    assert live.status_code == 200
+    assert [x["name"] for x in json.loads(live.body)["spaces"]] == ["DevTeam"]
+    assert plugin._admin_service is None
+    assert stale.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_commands_record_the_session_title(plugin, titles):
+    # Arrange
+    await plugin.initialize()
+
+    # Act
+    await run(plugin, Comp.Plain(text="/todo"), group=owner_group())
+    await run(plugin, Comp.Plain(text="/todo help"), private=True, name=" Alice ")
+    await run(plugin, Comp.Plain(text="/todo"), private=True, name="  ")
+    await run(plugin, Comp.Plain(text="/todo"))
+
+    # Assert: the last group call reuses the group name cached by the resolver.
+    assert titles == [
+        (GROUP, "Dev Team"),
+        ("qq:FriendMessage:u1", "Alice"),
+        (GROUP, "Dev Team"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_title_failure_does_not_break_the_command(
+    plugin, titles, monkeypatch
+):
+    # Arrange
+    await plugin.initialize()
+    titles.error = RuntimeError("db is gone")
+    errors = []
+    monkeypatch.setattr(main.logger, "exception", lambda *a, **k: errors.append(a))
+
+    # Act
+    replies = await run(plugin, Comp.Plain(text="/todo"), private=True)
+
+    # Assert
+    assert replies == [main.help_text()]
+    assert len(errors) == 1

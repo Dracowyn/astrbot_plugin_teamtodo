@@ -11,6 +11,10 @@ WebUI writes are logged with ``actor=None``, ``actor_label=<username>`` and
 ``session=""``. Tasks created here have ``creator=UserRef(WEBUI_PLATFORM,
 username)`` and ``created_session=""``.
 
+Space detail hides expired invites without deleting them. Task patches replace
+ordered assignee/tag collections atomically; dashboard assignees must already
+be members. Logs preserve deleted task snapshots and merge both event kinds.
+
 Like ``TodoService``, each public method runs in one ``store.transaction()``
 (reads may skip it) and raises ``TodoError`` with a Chinese user-facing
 message; unknown ids raise ``NotFound`` (a ``TodoError``).
@@ -24,20 +28,28 @@ from collections.abc import Callable
 from datetime import tzinfo
 
 from ..core.models import (
+    WEBUI_PLATFORM,
     Binding,
+    EventAction,
     Invite,
     Member,
     Priority,
     Space,
     SpaceEvent,
+    SpaceEventAction,
+    SpaceEventDraft,
     SpaceRole,
+    Task,
+    TaskDraft,
     TaskEvent,
     TaskStatus,
     TodoError,
     UserRef,
 )
 from ..core.store import Store
-from .todo_service import TaskListResult, TaskResult
+from . import task_ops
+from .access import is_invite_expired, new_invite
+from .todo_service import TaskListResult, TaskResult, TodoService
 
 MAX_EVENTS = 200
 """Upper bound for ``list_events(limit)``."""
@@ -107,39 +119,86 @@ class AdminService:
             tz: Configured time zone.
             clock: Wall-clock Unix seconds.
         """
-        raise NotImplementedError
+        self._store = store
+        self.tz = tz
+        self._clock = clock
 
     def now(self) -> float:
         """Current Unix time in seconds."""
-        raise NotImplementedError
+        return self._clock()
 
     # ----- spaces -----
 
     def list_spaces(self) -> list[SpaceSummary]:
         """All spaces, bound or not, ordered by ``Space.id``."""
-        raise NotImplementedError
+        now = self.now()
+        return [self._summary(space, now) for space in self._store.list_spaces()]
 
     def get_space(self, space_id: int) -> SpaceDetail:
         """One space in detail. Raises ``NotFound``."""
-        raise NotImplementedError
+        space = self._space(space_id)
+        now = self.now()
+        bindings = self._store.list_space_bindings(space_id)
+        titles = self._store.get_session_titles([b.session for b in bindings])
+        ranks = {SpaceRole.OWNER: 0, SpaceRole.ADMIN: 1, SpaceRole.MEMBER: 2}
+        members = sorted(
+            self._store.list_members(space_id),
+            key=lambda member: (ranks[member.role], member.joined_at),
+        )
+        invite = self._store.get_invite(space_id)
+        if invite is not None and is_invite_expired(invite, now):
+            invite = None
+        return SpaceDetail(
+            self._summary(space, now),
+            [(binding, titles.get(binding.session)) for binding in bindings],
+            members,
+            invite,
+        )
 
     def rename_space(self, username: str, space_id: int, name: str) -> Space:
         """Rename a space (same validation as ``/todo space rename``; the new
         name must not collide with another space bound to any session that
         this space is bound to). Logs RENAME. Raises ``NotFound``/``TodoError``.
         """
-        raise NotImplementedError
+        with self._store.transaction():
+            space = self._space(space_id)
+            name = TodoService._check_space_name(name)
+            for binding in self._store.list_space_bindings(space_id):
+                existing = self._store.session_space_names(binding.session).get(name)
+                if existing is not None and existing != space_id:
+                    raise TodoError("绑定会话中已有同名空间")
+            if name == space.name:
+                return space
+            updated = self._store.rename_space(space_id, name)
+            self._log_space(
+                username,
+                space_id,
+                SpaceEventAction.RENAME,
+                {"name": [space.name, name]},
+            )
+            return updated
 
     def delete_space(self, username: str, space_id: int) -> None:
         """Delete a space and everything under it (no confirmation code: the
         page asks before calling). Raises ``NotFound``."""
-        raise NotImplementedError
+        with self._store.transaction():
+            self._space(space_id)
+            self._store.delete_space(space_id)
 
     def unbind(self, username: str, space_id: int, session: str) -> None:
         """Unbind ``session`` from the space, with the same cleanup of the
         session default and current-space rows as ``/todo leave``. Logs
         UNBIND. Raises ``NotFound`` (space, or session not bound to it)."""
-        raise NotImplementedError
+        with self._store.transaction():
+            self._space(space_id)
+            if not any(
+                b.session == session for b in self._store.list_space_bindings(space_id)
+            ):
+                raise NotFound("会话未绑定到此空间")
+            self._store.unbind(session, space_id)
+            self._log_space(
+                username, space_id, SpaceEventAction.UNBIND, {"session": session}
+            )
 
     def set_role(
         self, username: str, space_id: int, user: UserRef, role: SpaceRole
@@ -147,22 +206,58 @@ class AdminService:
         """Make a member ADMIN or MEMBER. ``role`` OWNER and changing the
         owner's role raise ``TodoError``; same role is a no-op (no log).
         Logs ROLE. Raises ``NotFound`` (space or member)."""
-        raise NotImplementedError
+        with self._store.transaction():
+            self._space(space_id)
+            member = self._store.get_member(space_id, user)
+            if member is None:
+                raise NotFound("空间成员不存在")
+            if role == SpaceRole.OWNER or member.role == SpaceRole.OWNER:
+                raise TodoError("不能在管理页修改所有者角色")
+            if role == member.role:
+                return member
+            updated = self._store.set_member_role(space_id, user, role)
+            self._log_space(
+                username,
+                space_id,
+                SpaceEventAction.ROLE,
+                {"user": user.key, "role": [member.role, role]},
+            )
+            return updated
 
     def reset_invite(self, username: str, space_id: int) -> tuple[str, Invite]:
         """Create a new invite (old one invalid at once), same lifetime as
         ``/todo invite``. Returns the plain code, shown once. Logs INVITE."""
-        raise NotImplementedError
+        with self._store.transaction():
+            self._space(space_id)
+            code, invite = new_invite(space_id, self.now())
+            invite = self._store.set_invite(
+                space_id, invite.code_hash, invite.expires_at
+            )
+            self._log_space(
+                username,
+                space_id,
+                SpaceEventAction.INVITE,
+                {"expires_at": invite.expires_at},
+            )
+            return code, invite
 
     # ----- tasks -----
 
     def list_tasks(self, space_id: int, include_archived: bool) -> TaskListResult:
         """Tasks ordered by ``seq``; ARCHIVED only when asked. ``NotFound``."""
-        raise NotImplementedError
+        space = self._space(space_id)
+        statuses = tuple(
+            s for s in TaskStatus if include_archived or s != TaskStatus.ARCHIVED
+        )
+        return TaskListResult(
+            space, self._store.list_tasks(space_id, statuses), self._nicknames(space_id)
+        )
 
     def get_task(self, space_id: int, seq: int) -> TaskResult:
         """One task. Raises ``NotFound``."""
-        raise NotImplementedError
+        space = self._space(space_id)
+        task = self._task(space_id, seq)
+        return TaskResult(space, task, self._nicknames(space_id))
 
     def create_task(
         self,
@@ -179,7 +274,35 @@ class AdminService:
         """Create a task; assignees must be members. Logs CREATE.
         ``added_assignees`` in the result lists all assignees (no chat
         notification is sent from the WebUI)."""
-        raise NotImplementedError
+        with self._store.transaction():
+            space = self._space(space_id)
+            assignees = tuple(dict.fromkeys(assignees))
+            for user in assignees:
+                if self._store.get_member(space_id, user) is None:
+                    raise TodoError("负责人必须是空间成员")
+            draft = TaskDraft(
+                space_id=space_id,
+                title=title,
+                creator=UserRef(WEBUI_PLATFORM, username),
+                created_session="",
+                assignees=assignees,
+                due_at=due_at,
+                tags=tuple(dict.fromkeys(tags)),
+                priority=priority,
+                description=description.strip(),
+            )
+            task_ops.check_task(draft)
+            task = self._store.create_task(draft)
+            task_ops.log_event(
+                self._store,
+                task,
+                EventAction.CREATE,
+                {"title": task.title},
+                actor=None,
+                actor_label=username,
+                session="",
+            )
+            return TaskResult(space, task, self._nicknames(space_id), task.assignees)
 
     def update_task(
         self, username: str, space_id: int, seq: int, patch: TaskPatch
@@ -187,11 +310,65 @@ class AdminService:
         """Apply a patch atomically with the rules of ``TodoService.update_task``
         (status/``done_at``, ``reminded`` reset, one log entry per kind of
         change). An empty or no-op patch returns the task unchanged."""
-        raise NotImplementedError
+        with self._store.transaction():
+            space = self._space(space_id)
+            task = self._task(space_id, seq)
+            assignees = task.assignees
+            if patch.assignees is not None:
+                assignees = tuple(dict.fromkeys(patch.assignees))
+                for user in assignees:
+                    if self._store.get_member(space_id, user) is None:
+                        raise TodoError("负责人必须是空间成员")
+            proposed = dcs.replace(
+                task,
+                title=task.title if patch.title is None else patch.title,
+                description=task.description
+                if patch.description is None
+                else patch.description.strip(),
+                status=task.status if patch.status is None else patch.status,
+                assignees=assignees,
+                due_at=None
+                if patch.clear_due
+                else task.due_at
+                if patch.due_at is None
+                else patch.due_at,
+                tags=task.tags
+                if patch.tags is None
+                else tuple(dict.fromkeys(patch.tags)),
+                priority=None
+                if patch.clear_priority
+                else task.priority
+                if patch.priority is None
+                else patch.priority,
+            )
+            saved = task_ops.apply(
+                self._store,
+                self._clock,
+                task,
+                proposed,
+                actor=None,
+                actor_label=username,
+                session="",
+            )
+            added = tuple(user for user in assignees if user not in task.assignees)
+            return TaskResult(space, saved or task, self._nicknames(space_id), added)
 
     def delete_task(self, username: str, space_id: int, seq: int) -> TaskResult:
         """Hard-delete with a snapshot DELETE event. Raises ``NotFound``."""
-        raise NotImplementedError
+        with self._store.transaction():
+            space = self._space(space_id)
+            task = self._task(space_id, seq)
+            task_ops.log_event(
+                self._store,
+                task,
+                EventAction.DELETE,
+                {"snapshot": dcs.asdict(task)},
+                actor=None,
+                actor_label=username,
+                session="",
+            )
+            self._store.delete_task(space_id, seq)
+            return TaskResult(space, task, self._nicknames(space_id))
 
     # ----- log -----
 
@@ -203,4 +380,72 @@ class AdminService:
         ``min(limit, MAX_EVENTS)``. With ``task_seq`` only that task's
         entries. Also returns member nicknames (``UserRef.key`` -> name) for
         rendering. Raises ``NotFound``."""
-        raise NotImplementedError
+        self._space(space_id)
+        limit = max(0, min(limit, MAX_EVENTS))
+        entries: list[LogEntry] = list(
+            self._store.list_events(space_id, task_seq, limit)
+        )
+        if task_seq is None:
+            entries.extend(self._store.list_space_events(space_id, limit))
+        entries.sort(
+            key=lambda event: (
+                event.created_at,
+                event.id,
+                isinstance(event, TaskEvent),
+            ),
+            reverse=True,
+        )
+        return entries[:limit], self._nicknames(space_id)
+
+    def _space(self, space_id: int) -> Space:
+        space = self._store.get_space(space_id)
+        if space is None:
+            raise NotFound("空间不存在")
+        return space
+
+    def _task(self, space_id: int, seq: int) -> Task:
+        task = self._store.get_task(space_id, seq)
+        if task is None:
+            raise NotFound("任务不存在")
+        return task
+
+    def _nicknames(self, space_id: int) -> dict[str, str]:
+        return {
+            m.user.key: m.nickname
+            for m in self._store.list_members(space_id)
+            if m.nickname
+        }
+
+    def _summary(self, space: Space, now: float) -> SpaceSummary:
+        tasks = self._store.list_tasks(space.id, tuple(TaskStatus))
+        counts = dict.fromkeys(TaskStatus, 0)
+        overdue = 0
+        for task in tasks:
+            counts[task.status] += 1
+            if (
+                task.status in (TaskStatus.TODO, TaskStatus.DOING)
+                and task.due_at is not None
+                and task.due_at < now
+            ):
+                overdue += 1
+        return SpaceSummary(
+            space,
+            len(self._store.list_space_bindings(space.id)),
+            len(self._store.list_members(space.id)),
+            counts,
+            overdue,
+        )
+
+    def _log_space(
+        self, username: str, space_id: int, action: SpaceEventAction, detail: dict
+    ) -> None:
+        self._store.add_space_event(
+            SpaceEventDraft(
+                space_id,
+                action,
+                detail,
+                actor=None,
+                actor_label=username,
+                session="",
+            )
+        )

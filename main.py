@@ -8,9 +8,9 @@ instead of a ``command_group``: AstrBot answers a bare group command with its
 own "missing arguments" tree, while the design requires bare ``/todo`` to show
 the plugin's help text.
 
-The plugin also registers the LLM tools (``services/llm_tools.py``) and runs
-the due-reminder loop (``services/reminders.py``), whose messages are sent
-from here.
+The plugin also registers the LLM tools (``services/llm_tools.py``) and the
+WebUI management API (``services/web_api.py``), and runs the due-reminder loop
+(``services/reminders.py``), whose messages are sent from here.
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ from .services.access import (
     JoinRateLimiter,
     SessionAdminResolver,
 )
+from .services.admin_service import AdminService
 from .services.event_context import (
     PLUGIN_NAME,
     assignment_chain,
@@ -71,6 +72,7 @@ from .services.render import (
     task_list,
 )
 from .services.todo_service import TodoService, auto_space_name
+from .services.web_api import WebApi
 
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_REMIND_BEFORE_MINUTES = 60
@@ -135,6 +137,7 @@ class TeamTodoPlugin(Star):
         self._tz = load_timezone(str(config.get("timezone") or DEFAULT_TIMEZONE))
         self._store: Store | None = None
         self._service: TodoService | None = None
+        self._admin_service: AdminService | None = None
         self._resolver = SessionAdminResolver()
         self._joins = JoinRateLimiter()
         self._confirms = ConfirmationCodes()
@@ -159,6 +162,18 @@ class TeamTodoPlugin(Star):
         context.add_llm_tools(
             *TeamTodoToolkit(lambda: self._service, self._resolver).build()
         )
+        # Same lazy pattern for the WebUI routes. AstrBot never unregisters web
+        # routes: a reload re-registers every (route, method) and so replaces
+        # the old handlers, while after uninstall the stale handlers see None
+        # and answer 503 instead of touching the closed store.
+        web_api = WebApi(
+            lambda: self._admin_service,
+            self._tz,
+            remind_before_minutes=self._remind_minutes,
+            auto_archive_days=self._archive_days,
+        )
+        for route, handler, methods, desc in web_api.routes():
+            context.register_web_api(route, handler, methods, desc)
 
     async def initialize(self) -> None:
         """Open the database, build the services and start the reminder loop."""
@@ -170,6 +185,7 @@ class TeamTodoPlugin(Star):
             join_limiter=self._joins,
             confirmations=self._confirms,
         )
+        self._admin_service = AdminService(self._store, self._tz)
         reminders = ReminderService(
             self._store,
             lead_seconds=self._remind_minutes * 60,
@@ -190,6 +206,7 @@ class TeamTodoPlugin(Star):
                 except Exception:
                     logger.exception("[teamtodo] Reminder loop ended with an error")
         self._service = None
+        self._admin_service = None
         if self._store is not None:
             self._store.close()
             self._store = None
@@ -245,6 +262,15 @@ class TeamTodoPlugin(Star):
         try:
             info = await self._resolver.resolve(event)
             actor = build_actor(event, info)
+            # Session title for the WebUI (design 7); must never break the command.
+            title = (
+                (event.get_sender_name() if actor.is_private else info.group_name) or ""
+            ).strip()
+            if title and self._service is not None:
+                try:
+                    self._service.note_session_title(actor.session, title)
+                except Exception:
+                    logger.exception("[teamtodo] Failed to record the session title")
             auto_name = auto_space_name(
                 actor.is_private, info.group_name, str(event.get_group_id() or "")
             )
