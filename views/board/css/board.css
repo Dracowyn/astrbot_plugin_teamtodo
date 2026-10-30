@@ -1,0 +1,68 @@
+/* Shared board styles (admin and public). Columns are whitespace plus a header rule;
+   each task is a typeset entry separated by hairlines. No boxes, no fills, no shadows. */
+
+.board {
+  display: grid; grid-template-columns: repeat(var(--cols, 3), minmax(0, 1fr));
+  column-gap: 44px; align-items: start;
+}
+.col { min-width: 0; }
+
+.col-head { display: flex; align-items: baseline; gap: 12px; padding-bottom: 2px; }
+.col-title { font-size: 13px; font-weight: 700; letter-spacing: .08em; }
+.col-rule { flex: 1; height: 1px; background: var(--rule); transform: translateY(-3px); transition: background-color .12s; }
+.col-count { font-size: 13px; color: var(--muted); }
+.col:has(.is-ghost) .col-rule { background: var(--accent); }
+
+.col-body { position: relative; }
+.cards { min-height: 72px; }
+.col-empty { position: absolute; top: 14px; left: 0; color: var(--faint); pointer-events: none; }
+
+/* ---- entry ---- */
+.card {
+  display: grid; grid-template-columns: 3.1em minmax(0, 1fr); column-gap: 4px;
+  padding: 12px 6px 12px 0; border-bottom: 1px solid var(--rule); min-width: 0;
+  transition: background-color .12s;
+}
+.card.is-editable { cursor: grab; margin: 0 -6px; padding-left: 6px; }
+.card.is-editable:hover { background: var(--hover); }
+.card.is-editable:active { cursor: grabbing; }
+.card.is-ghost { opacity: .35; }
+.card.is-chosen { background: var(--hover); }
+.card-seq { font-family: var(--mono); font-size: 12.5px; color: var(--muted); padding-top: 2px; }
+.card-main { min-width: 0; display: grid; gap: 2px; }
+.card-line { display: flex; align-items: baseline; gap: 8px; }
+.card-title { flex: 1; font-size: 15px; font-weight: 500; line-height: 1.5; overflow-wrap: anywhere; }
+.prio { flex: none; font-size: 11px; color: var(--text); }
+.card-meta { display: flex; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+.card-meta > span + span:not(.card-tags)::before { content: "·"; margin: 0 .5em; color: var(--control); }
+.card-meta > .card-tags { margin-left: .75em; }
+.card-meta > .card-tags:first-child { margin-left: 0; }
+.card-meta .is-overdue { color: var(--accent); font-weight: 600; }
+.card-tags > span + span { margin-left: .5em; }
+.card.is-done .card-title { color: var(--muted); font-weight: 400; text-decoration: line-through; text-decoration-color: var(--control); }
+.card.is-archived { opacity: .7; }
+.card-desc { margin-top: 6px; font-size: 13px; color: var(--muted); }
+.card-desc.is-clamped { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.card-desc a { color: var(--text); }
+.card-toggle {
+  justify-self: start; border: 0; background: none; padding: 2px 0; min-height: 28px;
+  color: var(--muted); font-size: 13px; text-decoration: underline; text-decoration-color: var(--control); text-underline-offset: 3px;
+}
+.card-toggle:hover { color: var(--text); }
+
+.rich-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; }
+
+@media (max-width: 900px) {
+  .board { column-gap: 24px; }
+  .card { grid-template-columns: 2.9em minmax(0, 1fr); }
+}
+@media (max-width: 700px) {
+  /* Columns become a horizontally swipeable strip, one full column per screen (tabs on the public page switch it). */
+  .board {
+    display: flex; overflow-x: auto; scroll-snap-type: x mandatory; column-gap: 32px;
+    margin: 0 calc(var(--page-pad, 16px) * -1); padding: 0 var(--page-pad, 16px) 8px;
+    scroll-padding: 0 var(--page-pad, 16px); overscroll-behavior-x: contain; scrollbar-width: none;
+  }
+  .board::-webkit-scrollbar { display: none; }
+  .col { flex: 0 0 100%; scroll-snap-align: start; }
+}

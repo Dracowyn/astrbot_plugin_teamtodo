@@ -1,0 +1,8 @@
+{
+  "views": {
+    "board": {
+      "title": "Team Todo",
+      "description": "Manage every todo space: drag cards between columns, edit tasks, and manage session bindings, member roles, invite codes and public links."
+    }
+  }
+}

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>团队待办 · 公开看板</title>
+<link rel="icon" href="data:,">
+<script src="./theme.js"></script>
+<link rel="stylesheet" href="./css/tokens.css">
+<link rel="stylesheet" href="./css/base.css">
+<link rel="stylesheet" href="./css/board.css">
+<link rel="stylesheet" href="./css/public.css">
+</head>
+<body>
+<!-- Asset URLs are relative on purpose: the M4 server serves this page at /b/<token>/ and the same directory
+     (css/, components/, vendor/) below it, so the token travels in the path and no ../ is needed. -->
+<div id="app"></div>
+<noscript><p style="padding:16px">需要启用 JavaScript 才能查看看板。</p></noscript>
+<script type="module" src="./public-app.js"></script>
+</body>
+</html>

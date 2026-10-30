@@ -1,0 +1,40 @@
+/* Design tokens. Typeset ledger: one neutral palette, hairline rules, and ONE accent (crimson) used for
+   selection, focus, overdue and the primary action. No fills behind content, no shadows at rest.
+   Type scale: 24 title / 15 task title / 14 body / 13 meta / 12 label. */
+
+:root {
+  --ground: #fcfcfb;
+  --surface: #ffffff;     /* drawer, dialog */
+  --hover: #f3f3f1;
+  --rule: #e6e6e3;        /* hairlines */
+  --control: #c9c9c5;     /* control borders */
+  --text: #18191b;
+  --muted: #5f6166;
+  --faint: #6e7075;       /* placeholders, 4.6:1 on --ground */
+  --accent: #b42340;
+  --on-accent: #ffffff;
+  --scrim: rgba(24, 25, 27, 0.35);
+  --float-shadow: 0 6px 24px rgba(24, 25, 27, 0.14);
+
+  --radius: 3px;
+  --control-h: 32px;
+  --font: "Inter", system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --ground: #121315;
+  --surface: #191a1d;
+  --hover: #1d1e21;
+  --rule: #2b2d31;
+  --control: #494b51;
+  --text: #ebebe8;
+  --muted: #a6a8ad;
+  --faint: #8d8f95;
+  --accent: #ff8fa3;
+  --on-accent: #2a0b12;
+  --scrim: rgba(0, 0, 0, 0.55);
+  --float-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+  color-scheme: dark;
+}
