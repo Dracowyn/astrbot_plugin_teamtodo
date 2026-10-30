@@ -24,13 +24,14 @@ from __future__ import annotations
 
 import dataclasses as dcs
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import tzinfo
 
 from ..core.models import (
     WEBUI_PLATFORM,
     Binding,
     EventAction,
+    GroupMember,
     Invite,
     Member,
     Priority,
@@ -223,6 +224,29 @@ class AdminService:
                 {"user": user.key, "role": [member.role, role]},
             )
             return updated
+
+    def sync_members(
+        self,
+        username: str,
+        space_id: int,
+        session: str,
+        members: Sequence[GroupMember],
+    ) -> int:
+        """Register the members of one bound group session (M3.1).
+
+        Each member is upserted (new ones join as MEMBER; existing ones only
+        get their nickname refreshed, roles never change); members missing
+        from the list are kept. Logs one SYNC ``{"session", "added"}`` even
+        when nothing was added.
+
+        Returns:
+            How many members were new to the space.
+
+        Raises:
+            NotFound: Unknown space, or ``session`` is not bound to it.
+            TodoError: A member's ``platform_id`` differs from the session's.
+        """
+        raise NotImplementedError
 
     def reset_invite(self, username: str, space_id: int) -> tuple[str, Invite]:
         """Create a new invite (old one invalid at once), same lifetime as

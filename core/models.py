@@ -104,6 +104,18 @@ class Actor:
 
 
 @dcs.dataclass(frozen=True)
+class GroupMember:
+    """A chat group member as listed by the platform (M3.1)."""
+
+    user: UserRef
+    """``platform_id`` is the platform instance id of the group's session."""
+    nickname: str
+    """Display name: the group card when set, else the account nickname."""
+    names: tuple[str, ...]
+    """Every non-empty name (card, account nickname) for exact matching."""
+
+
+@dcs.dataclass(frozen=True)
 class Space:
     """A container of tasks, bound to zero or more sessions."""
 
@@ -238,6 +250,7 @@ class SpaceEventAction(StrEnum):
     - CLAIM ``{}``
     - ROLE ``{"user": UserRef.key, "role": [old, new]}``
     - INVITE ``{"expires_at": float}`` (invite created or reset)
+    - SYNC ``{"session": str, "added": int}`` (WebUI group member sync, M3.1)
 
     Deleting a space deletes its log, so there is no DELETE entry.
     """
@@ -249,6 +262,7 @@ class SpaceEventAction(StrEnum):
     CLAIM = "claim"
     ROLE = "role"
     INVITE = "invite"
+    SYNC = "sync"
 
 
 @dcs.dataclass(frozen=True)

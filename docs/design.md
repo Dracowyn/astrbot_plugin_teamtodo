@@ -49,7 +49,8 @@
 
 - 身份 = 平台 + 用户 ID。昵称只用于显示，每次出现时更新。不同平台上的同一个人视为不同成员。
 - 成员是隐式的：在任一绑定会话里用过 todo（命令、LLM 工具、被 @ 指派）的人，自动成为该空间的成员。
-- 只能指派给空间成员。在绑定会话里被 @ 的人当场成为成员，可以直接被指派，因为 @ 能证明他确实在这个会话里。只用昵称匹配时，只在已有成员里查找。
+- 只能指派给空间成员。在绑定会话里被 @ 的人当场成为成员，可以直接被指派，因为 @ 能证明他确实在这个会话里。只用昵称匹配时，先在已有成员里查找，群聊里查不到再查群成员列表（M3.1，见第 7 节末尾）。
+- `/todo admin +@x` 同理：被 @ 的人不是成员时当场登记为成员再设为管理员；`-@x` 的对象不是成员仍然报错。
 
 ### 2.4 角色与权限
 
@@ -290,6 +291,19 @@
 - `SpaceSummary = {id, name, owner: User|null, created_at, binding_count, member_count, task_counts:{todo,doing,done,archived}, overdue_count}`
 - `SpaceDetail = SpaceSummary & {bindings: Binding[], members: Member[], invite: {expires_at}|null}`：邀请码明文不再返回。
 
+**M3.1 群成员补全**（用户 2026-10-31 选定“两者都要”）：
+
+问题：成员只在用过 todo 或被 @ 时登记，群里没互动过的人无法按昵称指派、无法设为管理员，WebUI 选人列表里也没有他们。
+
+- 平台能力：只有 QQ（`aiocqhttp`）能列出整个群的成员，直接调 OneBot `get_group_member_list`，拿到群名片 `card` 和账号昵称 `nickname`。其他平台退回 `event.get_group().members`（多数为空或只有部分人）；Telegram 等列不出来的平台只能靠 @。
+- 取成员：`services/group_members.py`。
+  - `from_event(event)`：聊天入口用。不是群聊、平台不支持或调用失败时返回 `None`（失败记 warning），不打断原流程。
+  - `from_session(context, session)`：WebUI 用。按会话串找平台实例；不是群聊或平台不支持时抛 `TodoError`，文案说明原因。
+  - 两者都排除机器人自己；显示名取群名片，没有时取昵称；`GroupMember.names` 同时带上两者，供精确匹配。
+- 聊天侧“用到时再查”：LLM 工具解析负责人时，@ 和已有成员都没匹配上，且是群聊、`space` 参数为空（即操作当前空间）时，拉一次本群成员列表，按任一名字精确匹配（忽略大小写和开头的 `@`）。规则与原来相同：多人同名报错让用户 @，不做模糊匹配。匹配到的人随指派当场登记为成员。每次工具调用最多拉一次。
+- WebUI 侧“从群同步成员”：设置页按钮，对空间绑定的每个群会话拉成员列表，全部登记为成员（`upsert_member`：已在的只刷新昵称，不改角色），不删除已退群的成员。每个会话写一条空间日志 `SYNC {"session", "added"}`。
+  - `POST spaces/<space_id>/members/sync`，入参 `{}`，返回 `{added: number, results: [{session, title: string|null, added: number|null, error: string|null}], detail: SpaceDetail}`。某个会话失败只记在它的 `error` 里，不影响其他会话；空间没有绑定会话时 `results` 为空。
+
 ## 8. 公开看板
 
 - 由插件自己启动的独立 HTTP 服务提供，不经过 WebUI 端口。原因是 `/api/plug/*` 和插件页面资源都需要登录 WebUI（见 AstrBot `astrbot/dashboard/server.py` 中的 `auth_middleware`）。
@@ -344,6 +358,7 @@
 | `services/task_ops.py`（M3） | `TodoService` 与 `AdminService` 共用的任务写入规则：长度校验、字段变更与状态规则、日志 |
 | `services/admin_service.py`（M3） | WebUI 管理操作（调用者都是 AstrBot 管理员） |
 | `services/web_api.py`（M3） | WebUI 接口：路由、参数校验、序列化 |
+| `services/group_members.py`（M3.1） | 从平台拉群成员列表（聊天事件或会话串两种入口） |
 
 **验证口径**：
 - 在插件目录下，用 AstrBot 的 `.venv` 运行：`..\..\..\.venv\Scripts\python.exe -m pytest -q --cov=astrbot_plugin_teamtodo --cov-report=term-missing tests`。`core/` 和 `services/` 每个模块的行覆盖率都要 ≥ 80%。
