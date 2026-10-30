@@ -9,6 +9,7 @@ from astrbot_plugin_teamtodo.core.models import (
     EventAction,
     Mention,
     Priority,
+    SpaceEventAction,
     SpaceRole,
     TaskStatus,
     TodoError,
@@ -766,10 +767,27 @@ def test_owner_appoints_and_revokes_admins(service, store, space):
     assert changed[0].role == SpaceRole.MEMBER
 
 
-def test_admin_target_must_be_member_and_not_owner(service, space):
+def test_adding_unknown_admin_registers_member_and_logs_role(service, store, space):
+    _, changed = service.set_admins(OWNER, AUTO, parse_assign(["+", mention("ghost")]))
+
+    target = store.get_member(space.id, user("ghost"))
+    assert target == changed[0]
+    assert target.nickname == "name-ghost"
+    assert target.role == SpaceRole.ADMIN
+    event = store.list_space_events(space.id)[0]
+    assert event.action == SpaceEventAction.ROLE
+    assert event.detail == {"user": user("ghost").key, "role": ["member", "admin"]}
+    assert event.actor == OWNER.user
+    assert event.session == GROUP_A
+
+
+def test_admin_removal_requires_member_and_target_cannot_be_owner(
+    service, store, space
+):
     # Act / Assert
     with pytest.raises(TodoError, match="还不是这个空间的成员"):
-        service.set_admins(OWNER, AUTO, parse_assign(["+", mention("ghost")]))
+        service.set_admins(OWNER, AUTO, parse_assign(["-", mention("ghost")]))
+    assert store.get_member(space.id, user("ghost")) is None
     with pytest.raises(TodoError, match="所有者"):
         service.set_admins(
             actor("root", bot_admin=True), AUTO, parse_assign(["-", mention("owner")])
@@ -1095,10 +1113,13 @@ def test_failed_space_changes_roll_back_log_and_state(service, store, space):
             OWNER,
             AUTO,
             AssignOps(
-                replace=None, add=(mention("member"), mention("unknown")), remove=()
+                replace=None,
+                add=(mention("member"), mention("new")),
+                remove=(mention("unknown"),),
             ),
         )
     assert store.get_member(space.id, MEMBER.user).role == SpaceRole.MEMBER
+    assert store.get_member(space.id, user("new")) is None
     assert store.list_space_events(space.id) == baseline
     with pytest.raises(TodoError):
         service.rename_space(MEMBER, AUTO, "Denied")

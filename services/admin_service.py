@@ -246,7 +246,27 @@ class AdminService:
             NotFound: Unknown space, or ``session`` is not bound to it.
             TodoError: A member's ``platform_id`` differs from the session's.
         """
-        raise NotImplementedError
+        with self._store.transaction():
+            self._space(space_id)
+            if not any(
+                b.session == session for b in self._store.list_space_bindings(space_id)
+            ):
+                raise NotFound("会话未绑定到此空间")
+            platform_id = session.split(":", 1)[0]
+            added = 0
+            for member in members:
+                if member.user.platform_id != platform_id:
+                    raise TodoError("成员平台与会话平台不一致")
+                if self._store.get_member(space_id, member.user) is None:
+                    added += 1
+                self._store.upsert_member(space_id, member.user, member.nickname)
+            self._log_space(
+                username,
+                space_id,
+                SpaceEventAction.SYNC,
+                {"session": session, "added": added},
+            )
+            return added
 
     def reset_invite(self, username: str, space_id: int) -> tuple[str, Invite]:
         """Create a new invite (old one invalid at once), same lifetime as

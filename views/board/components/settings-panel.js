@@ -2,7 +2,7 @@
 // (InlineError scope) right under the action. Share links are M4 and intentionally absent.
 import { ref, watch } from "../vue.js";
 import { LIMITS, ROLE_COLOR, ROLE_LABEL, describeSession, formatDateTime, userKey } from "../format.js";
-import { ask, removeSpace, renameSpace, resetInvite, setRole, state, unbind } from "../store.js";
+import { ask, removeSpace, renameSpace, resetInvite, setRole, state, syncMembers, unbind } from "../store.js";
 import CopyField from "./copy-field.js";
 import InlineError from "./inline-error.js";
 import Pill from "./pill.js";
@@ -43,7 +43,7 @@ export default {
 
     return {
       state, name, LIMITS, ROLE_COLOR, ROLE_LABEL, userKey, describeSession, formatDateTime,
-      renameSpace, confirmUnbind, confirmReset, confirmDelete, toggleRole, freshCode, inviteExpired,
+      renameSpace, syncMembers, confirmUnbind, confirmReset, confirmDelete, toggleRole, freshCode, inviteExpired,
     };
   },
   template: `
@@ -78,6 +78,20 @@ export default {
       </SettingsRow>
 
       <SettingsRow title="成员与角色" description="成员在绑定会话里用过 todo 即自动加入。所有者由系统指定，这里只能任命或撤销管理员。">
+        <div class="panel-actions"><button type="button" class="btn" :disabled="!state.space.bindings.length || state.pending.sync" @click="syncMembers">{{ state.pending.sync ? '同步中…' : '从群同步成员' }}</button></div>
+        <p class="hint">{{ state.space.bindings.length ? '从绑定的 QQ 群拉取成员列表，加入本空间；不会移除成员，也不改角色。' : '此空间没有绑定会话，无法同步；先在上方绑定群聊。' }}</p>
+        <InlineError scope="sync" />
+        <div v-if="state.syncResult" class="notice" role="status">
+          <ul class="sync-results">
+            <li v-for="r in state.syncResult.results" :key="r.session">
+              <span>{{ r.title || describeSession(r.session).text }}</span>
+              <span v-if="r.error" class="form-error is-bare">{{ r.error }}</span>
+              <span v-else class="hint">新增 {{ r.added }} 人</span>
+            </li>
+          </ul>
+          <p class="row-title">共新增 {{ state.syncResult.added }} 人</p>
+        </div>
+        <div class="scroll-box">
         <table class="table">
           <caption class="visually-hidden">空间成员</caption>
           <thead><tr><th scope="col">成员</th><th scope="col">角色</th><th scope="col"><span class="visually-hidden">操作</span></th></tr></thead>
@@ -96,6 +110,7 @@ export default {
             </tr>
           </tbody>
         </table>
+        </div>
         <InlineError scope="members" />
       </SettingsRow>
 

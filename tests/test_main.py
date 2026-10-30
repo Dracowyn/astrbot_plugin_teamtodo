@@ -7,7 +7,9 @@ import pytest
 import pytest_asyncio
 from astrbot_plugin_teamtodo import main
 from astrbot_plugin_teamtodo.core.models import (
+    GroupMember,
     Mention,
+    SpaceRole,
     Task,
     TaskStatus,
     TodoError,
@@ -361,9 +363,16 @@ async def test_end_to_end_space_commands(plugin):
     invite = await run(plugin, Comp.Plain(text="/todo invite"), **owner)
     code = invite[0].split("：")[1].split("\n")[0]
     joined_twice = await run(plugin, Comp.Plain(text=f"/todo join {code}"), **owner)
-    admin = await run(
-        plugin, Comp.Plain(text="/todo admin +"), Comp.At(qq="mod"), **owner
+    await run(
+        plugin,
+        Comp.Plain(text="/todo admin +"),
+        Comp.At(qq="mod", name="Moderator"),
+        **owner,
     )
+    member = plugin._store.get_member(1, UserRef(platform_id="qq", user_id="mod"))
+    assert member is not None
+    assert member.role is SpaceRole.ADMIN
+    assert member.nickname == "Moderator"
     claim = await run(plugin, Comp.Plain(text="/todo claim"), **owner)
     left = await run(plugin, Comp.Plain(text="/todo leave Ops"), **owner)
     confirm = await run(plugin, Comp.Plain(text="/todo space delete Core"), **owner)
@@ -380,7 +389,6 @@ async def test_end_to_end_space_commands(plugin):
     assert renamed == ["当前空间已改名为「Core」"]
     assert len(code) == 12
     assert joined_twice == ["本会话已经绑定了空间「Core」"]
-    assert admin == ["mod 还不是这个空间的成员"]
     assert claim == [DENIAL_MESSAGES[Op.CLAIM]]
     assert left == ["本会话已解绑空间「Ops」，空间和任务仍然保留"]
     assert "60 秒内" in confirm[0]
@@ -678,10 +686,66 @@ def test_registers_every_web_route_under_the_plugin_prefix(plugin):
     routes = [(route, methods) for route, _, methods, _ in plugin.context.web_apis]
 
     # Assert
-    assert len(routes) == 14
+    assert len(routes) == 15
     assert all(route.startswith("/astrbot_plugin_teamtodo/") for route, _ in routes)
     assert ("/astrbot_plugin_teamtodo/spaces/<space_id>/tasks", ["POST"]) in routes
     assert all(callable(handler) for _, handler, _, _ in plugin.context.web_apis)
+
+
+@pytest.mark.asyncio
+async def test_web_api_fetcher_reads_current_context(plugin, monkeypatch):
+    from astrbot_plugin_teamtodo.services import group_members
+
+    from astrbot.api.web import PluginRequest, bind_request_context
+
+    await plugin.initialize()
+    await run(plugin, Comp.Plain(text="/todo add 写周报"), group=owner_group())
+    calls = []
+    new_user = UserRef(platform_id="qq", user_id="new-member")
+
+    async def fetch(context, session):
+        calls.append((context, session))
+        return [
+            GroupMember(user=new_user, nickname="New Member", names=("New Member",))
+        ]
+
+    def sync(username, space_id, session, members):
+        with plugin._store.transaction():
+            for member in members:
+                plugin._store.upsert_member(space_id, member.user, member.nickname)
+        return len(members)
+
+    monkeypatch.setattr(group_members, "from_session", fetch)
+    monkeypatch.setattr(plugin._admin_service, "sync_members", sync)
+    handler = {r: h for r, h, m, _ in plugin.context.web_apis if m == ["POST"]}[
+        "/astrbot_plugin_teamtodo/spaces/<space_id>/members/sync"
+    ]
+    current_context = FakeContext()
+    plugin.context = current_context
+
+    async def json_body():
+        return {}
+
+    raw = SimpleNamespace(
+        method="POST",
+        url=SimpleNamespace(path="/x"),
+        headers={},
+        cookies={},
+        client=None,
+        json=json_body,
+        query_params=SimpleNamespace(multi_items=lambda: []),
+    )
+    with bind_request_context(PluginRequest(raw, username="root")):
+        response = await handler(space_id="1")
+
+    assert response.status_code == 200
+    assert calls == [(current_context, GROUP)]
+    reply = json.loads(response.body)
+    assert reply["added"] == 1
+    assert any(
+        member["user_id"] == new_user.user_id and member["nickname"] == "New Member"
+        for member in reply["detail"]["members"]
+    )
 
 
 @pytest.mark.asyncio

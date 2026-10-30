@@ -207,7 +207,8 @@
 - 负责人参数是显示名列表，每个名字按以下顺序解析：
   1. 本条消息里 @ 的人，按 @ 显示名匹配（忽略大小写和开头的 `@`）；
   2. 目标空间成员，按昵称完全匹配（忽略大小写）；
-  3. 匹配到多人：返回“有 N 位成员叫 X，请让用户直接 @ 对方”；一个都没有：返回“空间成员里没有 X，请让用户 @ 对方”。不做模糊匹配，不自己猜。
+  3. 前两步都未匹配，且是群聊、工具的 `space` 参数为空时，按需获取本群成员列表，按群名片或账号昵称完全匹配（去除首尾空白和开头的 `@`，忽略大小写）；每次工具调用最多获取一次。平台不支持或获取失败时沿用原来的无匹配结果。匹配到的人随指派登记为空间成员；已有空间成员优先；
+  4. 匹配到多个不同用户：返回“有 N 位成员叫 X，请让用户直接 @ 对方”；一个都没有：返回“空间成员里没有 X，请让用户 @ 对方”。不做模糊匹配，不自己猜。
 - `due` 传 ISO 8601；只有日期时按 23:59；没有时区时按配置时区。空字符串表示清除截止时间（仅 update）。`priority` 取 `high` / `medium` / `low`，update 里 `none` 表示清除。
 - 返回格式：成功时一行英文说明，加上用随机边界标记包裹的 JSON 数据（任务编号、空间名、标题、状态、负责人昵称、截止时间的本地 ISO 字符串、是否逾期、标签、优先级、描述），另附当前时间，方便 LLM 换算相对日期。不返回任何用户 ID。失败时返回 `Error: <原因>`。
 - 工具新增负责人时，同样按第 6 节发指派通知。
@@ -272,6 +273,7 @@
 | POST | `spaces/<space_id>/delete` | `{}` | `{ok: true}` |
 | POST | `spaces/<space_id>/unbind` | `{session}` | `SpaceDetail` |
 | POST | `spaces/<space_id>/members/role` | `{platform_id, user_id, role: "admin"\|"member"}` | `SpaceDetail` |
+| POST | `spaces/<space_id>/members/sync` | `{}` | `{added, results: [{session, title, added, error}], detail: SpaceDetail}` |
 | POST | `spaces/<space_id>/invite/reset` | `{}` | `{code, expires_at}`（明文码只在这次返回） |
 | GET | `spaces/<space_id>/tasks` | `include_archived=1`（可选） | `{tasks: Task[], server_time}` |
 | POST | `spaces/<space_id>/tasks` | `{title, assignees?: Ref[], due_at?, tags?, priority?, description?}` | `Task` |

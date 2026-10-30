@@ -24,6 +24,7 @@ export const state = reactive({
   filters: { assignee: "", tag: "" },
   drawer: null, // { seq, task, events, loadingEvents }
   events: [], // space-wide log
+  syncResult: null, // { added, results } of the last "sync members from groups" run; cleared on space switch
   freshInviteCode: null, // { spaceId, code, expires_at }: shown once, never refetched
   creating: null, // status the create panel adds to ("todo" | "doing" | "done"), null when closed
   sidebarOpen: false, // mobile drawer
@@ -136,6 +137,7 @@ export async function selectSpace(id, view = "board") {
   state.sidebarOpen = false;
   state.spaceError = "";
   state.freshInviteCode = null;
+  state.syncResult = null;
   state.filters = { assignee: "", tag: "" };
   state.loadingSpace = true;
   try {
@@ -283,6 +285,17 @@ export async function setRole(user, role) {
   if (!space) return;
   state.space = space;
   notify(role === "admin" ? `已任命 ${user.nickname} 为管理员` : `已撤销 ${user.nickname} 的管理员`);
+}
+
+/** Pulls the member lists of the bound QQ groups; the response carries the refreshed SpaceDetail. */
+export async function syncMembers() {
+  const id = state.spaceId;
+  state.syncResult = null;
+  const result = await attempt(() => api.syncMembers(id), "sync");
+  if (!result || state.spaceId !== id) return;
+  state.space = result.detail;
+  state.syncResult = { added: result.added, results: result.results };
+  await attempt(refreshSpaces, "sync");
 }
 
 /** The plain code exists only in this response; it is kept in memory for the current settings page only. */

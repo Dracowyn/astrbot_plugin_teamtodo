@@ -42,6 +42,7 @@ from ..core.models import (
     MAX_ASSIGNEES,
     MAX_TAGS,
     Actor,
+    GroupMember,
     Mention,
     Priority,
     Task,
@@ -49,6 +50,7 @@ from ..core.models import (
     TodoError,
 )
 from ..core.parsing import TaskFields, TaskRef
+from . import group_members
 from .access import SessionAdminResolver
 from .event_context import PLUGIN_NAME, assignment_chain, build_actor, message_parts
 from .render import task_line
@@ -105,9 +107,10 @@ _NAMES = {
     "maxItems": MAX_ASSIGNEES,
     "description": (
         "Display names. People @-mentioned in the current message match by "
-        "their @ name; otherwise the exact nickname of a space member. Never "
-        "guess: if the tool reports no or several matches, ask the user to @ "
-        "the person."
+        "their @ name; otherwise the exact nickname of a space member. In "
+        "group chats with space omitted, group member names are also matched. "
+        "Never guess: if the tool reports no or several matches, ask the user "
+        "to @ the person."
     ),
 }
 _TAGS = {"type": "array", "items": {"type": "string"}, "maxItems": MAX_TAGS}
@@ -408,19 +411,21 @@ class TeamTodoToolkit:
         return service, actor, auto_name
 
     @staticmethod
-    def _resolve(
+    async def _resolve(
         service: TodoService,
         actor: Actor,
         auto_name: str,
         space: str | None,
         names: Sequence[str],
         mentions: list[Mention],
+        event: AstrMessageEvent,
+        group_cache: dict[str, list[GroupMember] | None],
     ) -> tuple[Mention, ...]:
-        """Resolve assignee names (design 5, "M2 定稿"); never guesses.
+        """Resolve names by mention, space member, then current group member.
 
-        A name first matches people @-mentioned in this message by their @
-        name, then space members by exact nickname, both ignoring case and a
-        leading ``@``.
+        Matching ignores case and leading ``@``. Group lookup is lazy and
+        only applies with no explicit space; callers share ``group_cache``
+        across resolutions in a single tool call.
 
         Raises:
             TodoError: A name is empty, matches nobody, or matches several.
@@ -440,6 +445,17 @@ class TeamTodoToolkit:
                 hits = {
                     m.user.key: Mention(user=m.user, name=m.nickname)
                     for m in service.find_members(actor, auto_name, name, space)
+                }
+            if not hits and not space and event.get_group_id():
+                if "members" not in group_cache:
+                    group_cache["members"] = await group_members.from_event(event)
+                hits = {
+                    member.user.key: Mention(user=member.user, name=member.nickname)
+                    for member in group_cache["members"] or ()
+                    if any(
+                        alias.strip().lstrip("@").strip().casefold() == key
+                        for alias in member.names
+                    )
                 }
             if len(hits) > 1:
                 raise TodoError(
@@ -473,8 +489,8 @@ class TeamTodoToolkit:
         mentions = [p for p in message_parts(event) if isinstance(p, Mention)]
         fields = TaskFields(
             title=title.strip(),
-            mentions=self._resolve(
-                service, actor, auto_name, space, assignees, mentions
+            mentions=await self._resolve(
+                service, actor, auto_name, space, assignees, mentions, event, {}
             ),
             due_at=due_at,
             clear_due=False,
@@ -586,8 +602,16 @@ class TeamTodoToolkit:
             except (ValueError, OverflowError) as exc:
                 raise TodoError(INVALID_DUE) from exc
         mentions = [p for p in message_parts(event) if isinstance(p, Mention)]
-        removed = self._resolve(
-            service, actor, auto_name, space, remove_assignees, mentions
+        group_cache: dict[str, list[GroupMember] | None] = {}
+        removed = await self._resolve(
+            service,
+            actor,
+            auto_name,
+            space,
+            remove_assignees,
+            mentions,
+            event,
+            group_cache,
         )
         change = TaskUpdate(
             status=TaskStatus(status) if status else None,
@@ -599,8 +623,15 @@ class TeamTodoToolkit:
             add_tags=_clean_tags(add_tags),
             remove_tags=_clean_tags(remove_tags),
             description=description,
-            add_assignees=self._resolve(
-                service, actor, auto_name, space, add_assignees, mentions
+            add_assignees=await self._resolve(
+                service,
+                actor,
+                auto_name,
+                space,
+                add_assignees,
+                mentions,
+                event,
+                group_cache,
             ),
             remove_assignees=tuple(m.user for m in removed),
         )

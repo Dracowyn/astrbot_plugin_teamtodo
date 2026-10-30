@@ -38,6 +38,7 @@ export const renameSpace = (spaceId, name) => post(`spaces/${spaceId}/rename`, {
 export const deleteSpace = (spaceId) => post(`spaces/${spaceId}/delete`, {});
 export const unbindSession = (spaceId, session) => post(`spaces/${spaceId}/unbind`, { session });
 export const setMemberRole = (spaceId, user, role) => post(`spaces/${spaceId}/members/role`, { ...ref(user), role });
+export const syncMembers = (spaceId) => post(`spaces/${spaceId}/members/sync`, {});
 export const resetInvite = (spaceId) => post(`spaces/${spaceId}/invite/reset`, {});
 export const listTasks = (spaceId, includeArchived = false) =>
   get(`spaces/${spaceId}/tasks`, includeArchived ? { include_archived: 1 } : {});

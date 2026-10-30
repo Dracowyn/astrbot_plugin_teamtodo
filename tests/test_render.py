@@ -483,6 +483,37 @@ def test_space_event_summary_actions(action, detail, expected):
     )
 
 
+@pytest.mark.parametrize("added", [0, 1, 12])
+@pytest.mark.parametrize(
+    "session", ["qq-main:GroupMessage:123", "qq-main:GroupMessage:room:123"]
+)
+def test_space_sync_summary_preserves_session_convention(added, session):
+    event = make_event(
+        SpaceEventAction.SYNC, {"session": session, "added": added}, space=True
+    )
+    assert event_summary(event, {}, UTC) == (
+        f"从「{session}」同步群成员，新增 {added} 人"
+    )
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        {},
+        {"session": "qq-main:GroupMessage:123"},
+        {"added": 1},
+        *({"session": session, "added": 1} for session in (None, [], {}, 1, True)),
+        *(
+            {"session": "qq-main:GroupMessage:123", "added": added}
+            for added in (None, [], {}, "1", 1.5, True, False, -1)
+        ),
+    ],
+)
+def test_space_sync_malformed_detail_falls_back_to_action(detail):
+    event = make_event(SpaceEventAction.SYNC, detail, space=True)
+    assert event_summary(event, {}, UTC) == SpaceEventAction.SYNC.value
+
+
 def test_space_role_user_key_fallback_splits_at_first_colon():
     event = make_event(
         SpaceEventAction.ROLE,

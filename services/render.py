@@ -241,6 +241,15 @@ def event_summary(
                     "绑定会话" if event.action == SpaceEventAction.BIND else "解绑会话"
                 )
                 return f"{label}：{session}"
+        elif event.action == SpaceEventAction.SYNC:
+            session, added = detail["session"], detail["added"]
+            if (
+                isinstance(session, str)
+                and isinstance(added, int)
+                and not isinstance(added, bool)
+                and added >= 0
+            ):
+                return f"从「{session}」同步群成员，新增 {added} 人"
         elif event.action == SpaceEventAction.CLAIM:
             return "认领空间"
         elif event.action == SpaceEventAction.ROLE:

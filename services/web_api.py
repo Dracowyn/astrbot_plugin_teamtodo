@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import tzinfo
+from inspect import isawaitable
 from typing import Any
 
 from astrbot.api import logger
@@ -38,6 +39,7 @@ from ..core.models import (
     MAX_TAG_CHARS,
     MAX_TAGS,
     MAX_TITLE_CHARS,
+    GroupMember,
     Priority,
     SpaceRole,
     Task,
@@ -287,6 +289,7 @@ class WebApi:
         get_service: Callable[[], AdminService | None],
         tz: tzinfo,
         *,
+        fetch_group_members: Callable[[str], Awaitable[list[GroupMember]]],
         remind_before_minutes: int,
         auto_archive_days: int,
     ) -> None:
@@ -297,10 +300,12 @@ class WebApi:
                 before ``initialize()`` and after ``terminate()``. Read on
                 every request, never captured.
             tz: Configured time zone.
+            fetch_group_members: Fetches current members for a bound session.
             remind_before_minutes: Reminder lead time from the config.
             auto_archive_days: Auto-archive delay from the config.
         """
         self._get_service = get_service
+        self._fetch_group_members = fetch_group_members
         self._tz = tz
         self._remind_minutes = remind_before_minutes
         self._archive_days = auto_archive_days
@@ -321,6 +326,12 @@ class WebApi:
             ("spaces/<space_id>/delete", "POST", self._delete_space, "Delete space"),
             ("spaces/<space_id>/unbind", "POST", self._unbind, "Unbind a session"),
             ("spaces/<space_id>/members/role", "POST", self._set_role, "Set role"),
+            (
+                "spaces/<space_id>/members/sync",
+                "POST",
+                self._sync_members,
+                "Sync group members",
+            ),
             (
                 "spaces/<space_id>/invite/reset",
                 "POST",
@@ -374,7 +385,10 @@ class WebApi:
                 service = self._get_service()
                 if service is None:
                     return error_response(NOT_READY, status_code=503)
-                return json_response(op(service, body, **ids))
+                result = op(service, body, **ids)
+                if isawaitable(result):
+                    result = await result
+                return json_response(result)
             except InvalidInput as exc:
                 return error_response(str(exc), status_code=400)
             except NotFound as exc:
@@ -456,6 +470,44 @@ class WebApi:
             raise InvalidInput(f"会话必须是不超过 {MAX_SESSION_CHARS} 字的非空字符串")
         service.unbind(_username(), space_id, session)
         return _detail(service.get_space(space_id))
+
+    async def _sync_members(
+        self, service: AdminService, body: dict, space_id: int
+    ) -> dict[str, Any]:
+        """Sync each binding independently and return refreshed space details."""
+        detail = service.get_space(space_id)
+        username = _username()
+        total = 0
+        results = []
+        for binding, title in detail.bindings:
+            added = None
+            error = None
+            try:
+                members = await self._fetch_group_members(binding.session)
+                added = service.sync_members(
+                    username, space_id, binding.session, members
+                )
+                total += added
+            except TodoError as exc:
+                error = str(exc)
+            except Exception:
+                logger.exception(
+                    "[teamtodo] Fetching group members for %s failed", binding.session
+                )
+                error = "获取群成员失败"
+            results.append(
+                {
+                    "session": binding.session,
+                    "title": title,
+                    "added": added,
+                    "error": error,
+                }
+            )
+        return {
+            "added": total,
+            "results": results,
+            "detail": _detail(service.get_space(space_id)),
+        }
 
     def _set_role(
         self, service: AdminService, body: dict, space_id: int

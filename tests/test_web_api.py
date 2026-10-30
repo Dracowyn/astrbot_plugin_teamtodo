@@ -9,6 +9,7 @@ from astrbot_plugin_teamtodo.core.models import (
     MAX_TAGS,
     MAX_TITLE_CHARS,
     Actor,
+    GroupMember,
     Mention,
     Priority,
     TaskStatus,
@@ -70,6 +71,7 @@ ROUTES = {
     ("spaces/<space_id>/delete", "POST"),
     ("spaces/<space_id>/unbind", "POST"),
     ("spaces/<space_id>/members/role", "POST"),
+    ("spaces/<space_id>/members/sync", "POST"),
     ("spaces/<space_id>/invite/reset", "POST"),
     ("spaces/<space_id>/tasks", "GET"),
     ("spaces/<space_id>/tasks", "POST"),
@@ -116,9 +118,21 @@ def holder(store):
 
 
 @pytest.fixture
-def routes(holder):
+def fetch_members():
+    async def fetch(session):
+        return []
+
+    return fetch
+
+
+@pytest.fixture
+def routes(holder, fetch_members):
     api = web_api.WebApi(
-        lambda: holder["service"], TZ, remind_before_minutes=60, auto_archive_days=7
+        lambda: holder["service"],
+        TZ,
+        fetch_group_members=fetch_members,
+        remind_before_minutes=60,
+        auto_archive_days=7,
     )
     return {
         (route.removeprefix(PREFIX), methods[0]): handler
@@ -167,9 +181,15 @@ async def send(
 # ----- routes and readiness -----------------------------------------------
 
 
-def test_route_table_matches_the_design(routes, holder):
+def test_route_table_matches_the_design(routes, holder, fetch_members):
     # Arrange
-    api = web_api.WebApi(lambda: None, TZ, remind_before_minutes=1, auto_archive_days=1)
+    api = web_api.WebApi(
+        lambda: None,
+        TZ,
+        fetch_group_members=fetch_members,
+        remind_before_minutes=1,
+        auto_archive_days=1,
+    )
 
     # Act
     registered = api.routes()
@@ -888,3 +908,107 @@ async def test_error_mapping(routes, holder, monkeypatch, error, status, message
     # Assert
     assert result == (status, {"status": "error", "message": message, "data": None})
     assert len(logged) == (1 if status == 500 else 0)
+
+
+@pytest.mark.asyncio
+async def test_sync_members_continues_failures_and_refreshes_detail(
+    holder, seeded, store, monkeypatch
+):
+    sessions = [
+        GROUP,
+        "qq:GroupMessage:2000",
+        "qq:GroupMessage:3000",
+        "qq:GroupMessage:4000",
+    ]
+    with store.transaction():
+        for session in sessions[1:]:
+            store.bind(session, 1)
+    members = {
+        session: [
+            GroupMember(
+                user=UserRef(platform_id="qq", user_id=f"new{index}"),
+                nickname="New",
+                names=("New",),
+            )
+        ]
+        for index, session in enumerate(sessions)
+        if index in (0, 3)
+    }
+    fetched, synced, logged = [], [], []
+
+    async def fetch(session):
+        fetched.append(session)
+        if session == sessions[1]:
+            raise TodoError("群不可用")
+        if session == sessions[2]:
+            raise RuntimeError("secret adapter failure")
+        return members[session]
+
+    def sync(username, space_id, session, received):
+        synced.append((username, space_id, session, received))
+        with store.transaction():
+            for member in received:
+                store.upsert_member(space_id, member.user, member.nickname)
+        return 1
+
+    monkeypatch.setattr(holder["service"], "sync_members", sync)
+    monkeypatch.setattr(web_api.logger, "exception", lambda *args: logged.append(args))
+    api = web_api.WebApi(
+        lambda: holder["service"],
+        TZ,
+        fetch_group_members=fetch,
+        remind_before_minutes=60,
+        auto_archive_days=7,
+    )
+    routes = {(r.removeprefix(PREFIX), m[0]): h for r, h, m, _ in api.routes()}
+    status, reply = await send(
+        routes,
+        "POST",
+        "spaces/<space_id>/members/sync",
+        space_id="1",
+        username=" root\n admin ",
+    )
+
+    assert status == 200
+    assert fetched == sessions
+    assert reply["added"] == 2
+    assert reply["results"] == [
+        {
+            "session": session,
+            "title": "Dev Team" if session == GROUP else None,
+            "added": 1 if index in (0, 3) else None,
+            "error": {1: "群不可用", 2: "获取群成员失败"}.get(index),
+        }
+        for index, session in enumerate(sessions)
+    ]
+    assert synced == [
+        ("root admin", 1, sessions[index], members[sessions[index]]) for index in (0, 3)
+    ]
+    assert logged
+    assert any(member["nickname"] == "New" for member in reply["detail"]["members"])
+
+
+@pytest.mark.asyncio
+async def test_sync_members_without_bindings(routes, seeded, store):
+    with store.transaction():
+        store.unbind(GROUP, 1)
+    status, reply = await send(
+        routes, "POST", "spaces/<space_id>/members/sync", space_id="1"
+    )
+    assert status == 200
+    assert reply["added"] == 0
+    assert reply["results"] == []
+    assert reply["detail"]["bindings"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("space_id", "body", "expected"), [("999", {}, 404), ("0", {}, 400), ("1", [], 400)]
+)
+async def test_sync_members_uses_endpoint_validation(
+    routes, seeded, space_id, body, expected
+):
+    status, _ = await send(
+        routes, "POST", "spaces/<space_id>/members/sync", body, space_id=space_id
+    )
+    assert status == expected

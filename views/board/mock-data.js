@@ -45,6 +45,7 @@ export const SPACES = [
     bindings: [
       { session: GROUP_A, title: "计网课设 · 第三组", bound_at: NOW - 21 * DAY },
       { session: GROUP_B, title: null, bound_at: NOW - 9 * DAY },
+      { session: "telegram:GroupMessage:-1002284417305", title: "Telegram 讨论组", bound_at: NOW - 5 * DAY },
     ],
     members: [
       member(USERS.yutong, "owner", 21),

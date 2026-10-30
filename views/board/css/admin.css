@@ -193,6 +193,11 @@
 .table td { padding: 8px 0; border-top: 1px solid var(--rule); vertical-align: middle; }
 .table .cell-action { text-align: right; }
 .table .hint { line-height: 1.3; }
+.scroll-box { max-height: 480px; overflow-y: auto; }
+.scroll-box .table th { position: sticky; top: 0; background: var(--ground); }
+.sync-results { display: grid; gap: 4px; padding: 0; margin: 0; list-style: none; }
+.sync-results li { display: flex; flex-wrap: wrap; gap: 4px 12px; justify-content: space-between; }
+.form-error.is-bare::before { content: none; }
 
 /* ---- dialog + toasts ---- */
 .dialog { width: min(440px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--rule); border-radius: var(--radius-lg); background: var(--surface); color: var(--text); box-shadow: var(--float-shadow); }

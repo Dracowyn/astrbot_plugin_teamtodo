@@ -6,6 +6,7 @@ from datetime import timezone
 import pytest
 from astrbot_plugin_teamtodo.core.models import (
     EventAction,
+    GroupMember,
     Priority,
     SpaceEventAction,
     SpaceEventDraft,
@@ -89,6 +90,7 @@ def test_detail_and_summary(env):
         lambda s: s.delete_space("u", 999),
         lambda s: s.unbind("u", 999, "a"),
         lambda s: s.set_role("u", 999, UserRef("x", "x"), SpaceRole.MEMBER),
+        lambda s: s.sync_members("u", 999, "chat:GroupMessage:g", []),
         lambda s: s.reset_invite("u", 999),
         lambda s: s.list_tasks(999, False),
         lambda s: s.get_task(999, 1),
@@ -175,6 +177,121 @@ def test_roles_and_invites(env):
     assert store.find_invite(hash_invite_code(code2)) == invite2
     now[0] = invite2.expires_at
     assert service.get_space(space.id).invite is None
+
+
+def test_sync_members_refreshes_without_removing_or_changing_roles(env):
+    service, store, space, owner, first, second, now = env
+    session = "chat:GroupMessage:g"
+    newcomer = UserRef("chat", "new")
+    with store.transaction():
+        store.bind(session, space.id)
+        store.set_member_role(space.id, first, SpaceRole.ADMIN)
+    before = {m.user: m for m in store.list_members(space.id)}
+    now[0] += 20
+    added = service.sync_members(
+        "dashboard",
+        space.id,
+        session,
+        [
+            GroupMember(owner, "Owner refreshed", ()),
+            GroupMember(first, "Admin refreshed", ()),
+            GroupMember(newcomer, "New", ()),
+            GroupMember(newcomer, "New refreshed", ()),
+        ],
+    )
+    assert added == 1
+    for user, nickname in [(owner, "Owner refreshed"), (first, "Admin refreshed")]:
+        member = store.get_member(space.id, user)
+        assert member == dcs.replace(before[user], nickname=nickname)
+    assert store.get_member(space.id, second) == before[second]
+    member = store.get_member(space.id, newcomer)
+    assert member.role == SpaceRole.MEMBER
+    assert member.nickname == "New refreshed"
+    assert member.joined_at == now[0]
+    assert len(store.list_members(space.id)) == 4
+    events = store.list_space_events(space.id)
+    assert len(events) == 1
+    event = events[0]
+    assert event.action == SpaceEventAction.SYNC
+    assert event.detail == {"session": session, "added": 1}
+    assert event.actor is None and event.actor_label == "dashboard"
+    assert event.session == ""
+
+
+@pytest.mark.parametrize("existing_only", [False, True])
+def test_sync_members_logs_zero_additions(env, existing_only):
+    service, store, space, owner, *_ = env
+    session = "chat:GroupMessage:g"
+    with store.transaction():
+        store.bind(session, space.id)
+    before = store.list_members(space.id)
+    members = [GroupMember(owner, "", ())] if existing_only else []
+    assert service.sync_members("dashboard", space.id, session, members) == 0
+    assert store.list_members(space.id) == before
+    events = store.list_space_events(space.id)
+    assert len(events) == 1
+    event = events[0]
+    assert event.action == SpaceEventAction.SYNC
+    assert event.detail == {"session": session, "added": 0}
+    assert event.actor is None and event.actor_label == "dashboard"
+    assert event.session == ""
+
+
+def test_sync_members_requires_session_bound_to_target_space(env):
+    service, store, space, *_ = env
+    session = "chat:GroupMessage:other"
+    with store.transaction():
+        other = store.create_space("other", None)
+        store.bind(session, other.id)
+    before = store.list_members(space.id)
+    with pytest.raises(NotFound, match="会话未绑定到此空间"):
+        service.sync_members("dashboard", space.id, session, [])
+    assert store.list_members(space.id) == before
+    assert store.list_space_events(space.id) == []
+
+
+def test_sync_members_platform_mismatch_rolls_back_prior_upsert(env):
+    service, store, space, *_ = env
+    session = "chat:GroupMessage:g"
+    valid = UserRef("chat", "new")
+    invalid = UserRef("different", "new")
+    with store.transaction():
+        store.bind(session, space.id)
+    before = store.list_members(space.id)
+    with pytest.raises(TodoError, match="平台"):
+        service.sync_members(
+            "dashboard",
+            space.id,
+            session,
+            [GroupMember(valid, "Valid", ()), GroupMember(invalid, "Invalid", ())],
+        )
+    assert store.list_members(space.id) == before
+    assert store.get_member(space.id, valid) is None
+    assert store.get_member(space.id, invalid) is None
+    assert store.list_space_events(space.id) == []
+
+
+def test_sync_members_log_failure_rolls_back_members_and_log(env, monkeypatch):
+    service, store, space, *_ = env
+    session = "chat:GroupMessage:g"
+    newcomer = UserRef("chat", "new")
+    with store.transaction():
+        store.bind(session, space.id)
+    before = store.list_members(space.id)
+    add_event = store.add_space_event
+
+    def fail_after_log(draft):
+        add_event(draft)
+        raise RuntimeError("log failure")
+
+    monkeypatch.setattr(store, "add_space_event", fail_after_log)
+    with pytest.raises(RuntimeError, match="log failure"):
+        service.sync_members(
+            "dashboard", space.id, session, [GroupMember(newcomer, "New", ())]
+        )
+    assert store.list_members(space.id) == before
+    assert store.get_member(space.id, newcomer) is None
+    assert store.list_space_events(space.id) == []
 
 
 def test_task_replacement_status_and_identity(env):

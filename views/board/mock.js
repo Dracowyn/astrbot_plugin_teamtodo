@@ -3,7 +3,7 @@
 // JSON boundary, like the real wire. Demo-only switch: `?mockFail=<substring of "METHOD endpoint">` makes
 // matching calls reject, e.g. `?mockFail=POST spaces/1/tasks/3` (used to exercise error display and rollback).
 import { EVENTS, SPACES, TASKS, TIMEZONE, WEBUI_USER } from "./mock-data.js";
-import { LIMITS, PRIORITY_LABEL, STATUS_LABEL, formatDateTime, isOverdue, nowSeconds, userKey } from "./format.js";
+import { LIMITS, PRIORITY_LABEL, STATUS_LABEL, describeSession, formatDateTime, isOverdue, nowSeconds, userKey } from "./format.js";
 
 const LATENCY_MS = 70;
 const INVITE_TTL_SECONDS = 7 * 86400;
@@ -11,7 +11,13 @@ const INVITE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const ADMIN_LABEL = "admin（WebUI）";
 const MOCK_FAIL = new URLSearchParams(location.search).get("mockFail");
 
+const MOCK_MEMBERS = Math.min(Number(new URLSearchParams(location.search).get("mockMembers")) || 0, 500);
+
 const spaces = clone(SPACES);
+// Demo-only `?mockMembers=N` pads the first space to N members to check long-list behaviour.
+for (let i = spaces[0].members.length; i < MOCK_MEMBERS; i++) {
+  spaces[0].members.push({ platform_id: "aiocqhttp", user_id: String(5000000000 + i), nickname: `测试成员${String(i + 1).padStart(3, "0")}`, role: "member", joined_at: nowSeconds() - i * 3600 });
+}
 const tasks = clone(TASKS);
 const events = clone(EVENTS);
 
@@ -221,6 +227,30 @@ function rename(space, value) {
   log(space.id, null, "rename", `将空间重命名为「${name}」`);
 }
 
+// Names a QQ group "contains" for the member-sync demo: the first sync adds them, later syncs find nothing new.
+const GROUP_ROSTER = ["吴佳宁", "郑浩宇", "冯雨萱", "蒋文博", "沈清和", "韩若曦"];
+
+function syncMembers(space) {
+  const results = space.bindings.map((binding) => {
+    const [platform, kind, groupId] = binding.session.split(":");
+    const result = { session: binding.session, title: binding.title, added: null, error: null };
+    if (platform !== "aiocqhttp") result.error = kind === "GroupMessage" ? "该平台不支持获取群成员列表" : "该会话不是群聊";
+    else if (kind !== "GroupMessage") result.error = "该会话不是群聊";
+    else {
+      const start = Number(groupId.slice(-1)) % 4;
+      const fresh = GROUP_ROSTER.slice(start, start + 2 + (start >> 1)).map((nickname, i) => ({
+        platform_id: platform, user_id: String(8800000000 + start * 10 + i), nickname, role: "member", joined_at: nowSeconds(),
+      })).filter((m) => !space.members.some((x) => userKey(x) === userKey(m)));
+      space.members.push(...fresh);
+      result.added = fresh.length;
+    }
+    return result;
+  });
+  const added = results.reduce((sum, r) => sum + (r.added ?? 0), 0);
+  results.forEach((r) => r.added > 0 && log(space.id, null, "sync", `从「${r.title || describeSession(r.session).text}」同步群成员，新增 ${r.added} 人`));
+  return { added, results, detail: detail(space) };
+}
+
 // ---- public board ----
 
 function publicBoard(token) {
@@ -258,6 +288,7 @@ const routes = [
     return detail(s);
   }],
   ["POST", /^spaces\/(\d+)\/members\/role$/, (m, body) => { const s = getSpace(m[1]); setRole(s, body); return detail(s); }],
+  ["POST", /^spaces\/(\d+)\/members\/sync$/, (m) => syncMembers(getSpace(m[1]))],
   ["POST", /^spaces\/(\d+)\/invite\/reset$/, (m) => {
     const s = getSpace(m[1]);
     s.invite = { expires_at: nowSeconds() + INVITE_TTL_SECONDS };

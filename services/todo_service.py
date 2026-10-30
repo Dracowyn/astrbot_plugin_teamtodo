@@ -762,11 +762,10 @@ class TodoService:
     ) -> tuple[Space, list[Member]]:
         """Appoint (+@x) or revoke (-@x) admins; every mention needs a sign.
 
-        Returns the space and updated member rows; only actual changes log.
+        Unknown +@ targets join before promotion; unknown -@ targets fail.
 
         Raises:
-            TodoError: Bad usage, permission denied, target not a member, or
-                target is the owner.
+            TodoError: Bad usage, denied permission, unknown -@ target, or owner.
         """
         if ops.replace is not None:
             raise TodoError("用法：/todo admin +@某人 或 /todo admin -@某人")
@@ -780,6 +779,10 @@ class TodoService:
                 (m, SpaceRole.MEMBER) for m in ops.remove
             ]:
                 target = self._store.get_member(space.id, mention.user)
+                if target is None and role == SpaceRole.ADMIN:
+                    target = self._store.upsert_member(
+                        space.id, mention.user, mention.name
+                    )
                 if target is None:
                     label = mention.name or mention.user.user_id
                     raise TodoError(f"{label} 还不是这个空间的成员")

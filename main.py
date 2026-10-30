@@ -47,6 +47,7 @@ from .core.parsing import (
     text_of,
 )
 from .core.store import Store
+from .services import group_members
 from .services.access import (
     ConfirmationCodes,
     JoinRateLimiter,
@@ -169,6 +170,9 @@ class TeamTodoPlugin(Star):
         web_api = WebApi(
             lambda: self._admin_service,
             self._tz,
+            fetch_group_members=lambda session: group_members.from_session(
+                self.context, session
+            ),
             remind_before_minutes=self._remind_minutes,
             auto_archive_days=self._archive_days,
         )

@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from astrbot_plugin_teamtodo.core.models import (
     Actor,
+    GroupMember,
     Mention,
     TaskStatus,
     UserRef,
@@ -123,6 +124,20 @@ def enabled(monkeypatch):
         "is_plugin_enabled_for_session",
         staticmethod(is_enabled),
     )
+    return state
+
+
+@pytest.fixture
+def group_lookup(monkeypatch):
+    from astrbot_plugin_teamtodo.services import group_members
+
+    state = {"members": None, "calls": []}
+
+    async def from_event(event):
+        state["calls"].append(event)
+        return state["members"]
+
+    monkeypatch.setattr(group_members, "from_event", from_event)
     return state
 
 
@@ -446,12 +461,13 @@ async def test_bad_due_and_empty_tags_are_rejected(tools, store):
 
 
 @pytest.mark.asyncio
-async def test_mention_in_message_wins_over_member_nickname(tools, store):
+async def test_mention_in_message_wins_over_member_nickname(tools, store, group_lookup):
     # Arrange
     space = await seed_space(tools, store, ("b1", "Bob"))
     event = FakeEvent(
         Comp.At(qq="bot"), Comp.Plain(text="给 "), Comp.At(qq="m1", name="@bob")
     )
+    group_lookup["members"] = [GroupMember(user("g1"), "Bob", ("Bob",))]
 
     # Act
     out = await call(tools, "teamtodo_add_task", event, title="x", assignees=["@BOB"])
@@ -459,15 +475,20 @@ async def test_mention_in_message_wins_over_member_nickname(tools, store):
     # Assert
     assert store.get_task(space.id, 1).assignees == (user("m1"),)
     assert data_of(out)["assignees"] == ["@bob"]
+    assert group_lookup["calls"] == []
 
 
 @pytest.mark.asyncio
-async def test_member_nickname_matches_exactly_ignoring_case(tools, store):
+async def test_member_nickname_matches_exactly_ignoring_case(
+    tools, store, group_lookup
+):
     # Arrange
     space = await seed_space(tools, store, ("b1", "Bob"), ("b2", "Bobby"))
+    group_lookup["members"] = [GroupMember(user("g1"), "Bob", ("Bob",))]
 
     # Act
     exact = await call(tools, "teamtodo_add_task", title="x", assignees=["bob"])
+    assert group_lookup["calls"] == []
     fuzzy = await call(tools, "teamtodo_add_task", title="y", assignees=["Bo"])
 
     # Assert
@@ -494,6 +515,229 @@ async def test_ambiguous_names_are_not_guessed(tools, store):
     assert members == "Error: 有 2 位成员叫「Bob」，请让用户直接 @ 对方"
     assert mentions == "Error: 有 2 位成员叫「Eve」，请让用户直接 @ 对方"
     assert store.list_tasks(space.id, tuple(TaskStatus)) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", [" @ cArD ", " @@ aCcOuNt "])
+@pytest.mark.parametrize("space", [None, ""])
+async def test_group_card_and_account_names_register_member(
+    tools, store, group_lookup, name, space
+):
+    event = FakeEvent()
+    group_lookup["members"] = [
+        GroupMember(user("g1"), "Card", (" @ Card ", " @@ Account "))
+    ]
+
+    out = await call(
+        tools, "teamtodo_add_task", event, title="x", assignees=[name], space=space
+    )
+
+    assert out.startswith("Created task #1.")
+    assert data_of(out)["assignees"] == ["Card"]
+    saved_space = store.list_spaces()[0]
+    assert store.get_task(saved_space.id, 1).assignees == (user("g1"),)
+    assert store.get_member(saved_space.id, user("g1")).nickname == "Card"
+    assert group_lookup["calls"] == [event]
+    assert [(part.qq, part.name) for part in event.sent[0][1:-1]] == [("g1", "Card")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "members",
+    [None, [], [GroupMember(UserRef("qq", "g1"), "Bobby", ("Bobby",))]],
+)
+async def test_group_lookup_no_hit_preserves_message(
+    tools, store, group_lookup, members
+):
+    event = FakeEvent()
+    group_lookup["members"] = members
+
+    out = await call(tools, "teamtodo_add_task", event, title="x", assignees=["Bob"])
+
+    assert out == "Error: 空间成员里没有「Bob」，请让用户 @ 对方"
+    assert group_lookup["calls"] == [event]
+    assert all(
+        not store.list_tasks(s.id, tuple(TaskStatus)) for s in store.list_spaces()
+    )
+
+
+@pytest.mark.asyncio
+async def test_group_lookup_ambiguity_counts_distinct_users(tools, store, group_lookup):
+    group_lookup["members"] = [
+        GroupMember(user("g1"), "First", (" Bob ", "@BOB")),
+        GroupMember(user("g2"), "Second", ("bob",)),
+    ]
+
+    out = await call(tools, "teamtodo_add_task", title="x", assignees=["Bob"])
+
+    assert out == "Error: 有 2 位成员叫「Bob」，请让用户直接 @ 对方"
+    assert len(group_lookup["calls"]) == 1
+    assert all(
+        not store.list_tasks(s.id, tuple(TaskStatus)) for s in store.list_spaces()
+    )
+
+
+@pytest.mark.asyncio
+async def test_group_aliases_and_duplicate_rows_deduplicate_by_user(
+    tools, store, group_lookup
+):
+    event = FakeEvent()
+    member = GroupMember(user("g1"), "Card", ("Card", "@card", "Account"))
+    group_lookup["members"] = [member, member]
+
+    out = await call(
+        tools, "teamtodo_add_task", event, title="x", assignees=["card", "ACCOUNT"]
+    )
+
+    assert data_of(out)["assignees"] == ["Card"]
+    assert store.get_task(store.list_spaces()[0].id, 1).assignees == (user("g1"),)
+    assert group_lookup["calls"] == [event]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("private", [True, False])
+async def test_group_lookup_never_runs_for_private_or_explicit_space(
+    tools, group_lookup, private
+):
+    await call(tools, "teamtodo_list_tasks", FakeEvent(private=private))
+    event = FakeEvent(private=private)
+    group_lookup["members"] = [GroupMember(user("g1"), "Bob", ("Bob",))]
+
+    out = await call(
+        tools,
+        "teamtodo_add_task",
+        event,
+        title="x",
+        assignees=["Bob"],
+        **({} if private else {"space": SPACE}),
+    )
+
+    assert out == "Error: 空间成员里没有「Bob」，请让用户 @ 对方"
+    assert group_lookup["calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_group_lookup_once_for_multiple_distinct_names(tools, group_lookup):
+    event = FakeEvent()
+    group_lookup["members"] = [
+        GroupMember(user("g1"), "Bob", ("Bob",)),
+        GroupMember(user("g2"), "Eve", ("Eve",)),
+    ]
+
+    out = await call(
+        tools, "teamtodo_add_task", event, title="x", assignees=["Bob", "Eve"]
+    )
+
+    assert data_of(out)["assignees"] == ["Bob", "Eve"]
+    assert group_lookup["calls"] == [event]
+
+
+@pytest.mark.asyncio
+async def test_group_lookup_cache_is_shared_by_update_remove_and_add(
+    tools, store, group_lookup
+):
+    space = await seed_space(tools, store, ("b1", "Bob"))
+    await call(tools, "teamtodo_add_task", title="x", assignees=["Bob"])
+    event = FakeEvent()
+    group_lookup["members"] = [
+        GroupMember(user("b1"), "Bob", ("Old account",)),
+        GroupMember(user("e1"), "Eve", ("Eve account",)),
+        GroupMember(user("f1"), "Frank", ("Frank account",)),
+    ]
+
+    out = await call(
+        tools,
+        "teamtodo_update_task",
+        event,
+        number=1,
+        remove_assignees=["Old account"],
+        add_assignees=["Eve account", "Frank account"],
+    )
+
+    assert out.startswith("Applied the update to task #1;")
+    assert data_of(out)["assignees"] == ["Eve", "Frank"]
+    assert store.get_task(space.id, 1).assignees == (user("e1"), user("f1"))
+    assert store.get_member(space.id, user("e1")).nickname == "Eve"
+    assert group_lookup["calls"] == [event]
+
+
+@pytest.mark.asyncio
+async def test_group_lookup_cache_is_not_shared_across_calls(tools, group_lookup):
+    event = FakeEvent()
+    group_lookup["members"] = [GroupMember(user("g1"), "Card", ("Account",))]
+
+    first = await call(
+        tools, "teamtodo_add_task", event, title="first", assignees=["Account"]
+    )
+    group_lookup["members"] = [GroupMember(user("g2"), "Other card", ("Account",))]
+    second = await call(
+        tools, "teamtodo_add_task", event, title="second", assignees=["Account"]
+    )
+
+    assert data_of(first)["assignees"] == ["Card"]
+    assert data_of(second)["assignees"] == ["Other card"]
+    assert group_lookup["calls"] == [event, event]
+
+
+@pytest.mark.asyncio
+async def test_group_lookup_skipped_when_all_names_resolve(tools, store, group_lookup):
+    await seed_space(tools, store, ("b1", "Bob"))
+    event = FakeEvent(Comp.At(qq="e1", name="Eve"))
+
+    added = await call(
+        tools, "teamtodo_add_task", event, title="x", assignees=["Bob", "Eve"]
+    )
+    updated = await call(
+        tools,
+        "teamtodo_update_task",
+        event,
+        number=1,
+        remove_assignees=["Bob"],
+        add_assignees=["Eve"],
+    )
+
+    assert data_of(added)["assignees"] == ["Bob", "Eve"]
+    assert data_of(updated)["assignees"] == ["Eve"]
+    assert group_lookup["calls"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "guard",
+    [
+        "disabled",
+        "cron",
+        "not_addressed",
+        "invalid_schema",
+        "not_ready",
+        "bad_due",
+        "empty_name",
+    ],
+)
+async def test_group_lookup_does_not_precede_call_guards(
+    tools, enabled, holder, group_lookup, guard
+):
+    event = FakeEvent()
+    kwargs = {"title": "x", "assignees": ["Bob"]}
+    if guard == "disabled":
+        enabled["value"] = False
+    elif guard == "cron":
+        event.platform = "cron"
+    elif guard == "not_addressed":
+        event.is_at_or_wake_command = False
+    elif guard == "invalid_schema":
+        kwargs["title"] = 123
+    elif guard == "not_ready":
+        holder["service"] = None
+    elif guard == "bad_due":
+        kwargs["due"] = "next tuesday"
+    else:
+        kwargs["assignees"] = ["@ "]
+
+    out = await call(tools, "teamtodo_add_task", event, **kwargs)
+
+    assert out.startswith("Error:")
+    assert group_lookup["calls"] == []
 
 
 @pytest.mark.asyncio
